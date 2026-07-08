@@ -48,7 +48,7 @@ func init() {
       "url": "https://github.com/weaviate",
       "email": "hello@weaviate.io"
     },
-    "version": "1.38.0-dev"
+    "version": "1.39.0-dev"
   },
   "basePath": "/v1",
   "paths": {
@@ -1088,6 +1088,9 @@ func init() {
               "$ref": "#/definitions/ErrorResponse"
             }
           },
+          "404": {
+            "description": "No role found."
+          },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request.",
             "schema": {
@@ -1298,6 +1301,12 @@ func init() {
           "404": {
             "description": "No role found."
           },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
           "500": {
             "description": "An error has occurred while trying to fulfill the request. Most likely the ErrorResponse will contain more information about the error.",
             "schema": {
@@ -1500,6 +1509,12 @@ func init() {
           },
           "404": {
             "description": "No roles found for specified user."
+          },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
           },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request.",
@@ -3903,6 +3918,12 @@ func init() {
           "404": {
             "description": "Source object not found."
           },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request. Ensure the property exists and is a reference type.",
             "schema": {
@@ -3990,6 +4011,12 @@ func init() {
           "404": {
             "description": "Source object not found."
           },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request. Ensure the property exists and is a reference type.",
             "schema": {
@@ -4076,6 +4103,12 @@ func init() {
           },
           "404": {
             "description": "Object or reference not found.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
             "schema": {
               "$ref": "#/definitions/ErrorResponse"
             }
@@ -5684,7 +5717,10 @@ func init() {
             }
           },
           "404": {
-            "description": "Collection or property not found."
+            "description": "Collection or property not found. cancel:true with nothing to cancel returns 202 with Status: NO_OP instead — 404 is reserved for missing collection/property.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
           },
           "409": {
             "description": "Conflicting reindex task already running.",
@@ -6680,10 +6716,6 @@ func init() {
                   "description": "EXPERIMENTAL, DONT USE. THIS WILL BE REMOVED AGAIN. - import api key from static user",
                   "type": "boolean",
                   "default": false
-                },
-                "namespace": {
-                  "description": "Namespace to bind the new user to. Required on namespace-enabled clusters. Must be set by a global operator only.",
-                  "type": "string"
                 }
               }
             }
@@ -7244,6 +7276,10 @@ func init() {
           "description": "The ID of the backup. Must be URL-safe and work as a filesystem path, only lowercase, numbers, underscore, minus characters allowed.",
           "type": "string"
         },
+        "incremental_base_backup_id": {
+          "description": "The ID of the base backup this incremental backup was built on; empty if the backup is not incremental.",
+          "type": "string"
+        },
         "path": {
           "description": "Destination path of backup files valid for the selected backend.",
           "type": "string"
@@ -7295,6 +7331,10 @@ func init() {
           },
           "id": {
             "description": "The ID of the backup. Must be URL-safe and work as a filesystem path, only lowercase, numbers, underscore, minus characters allowed.",
+            "type": "string"
+          },
+          "incremental_base_backup_id": {
+            "description": "The ID of the base backup this incremental backup was built on; empty if the backup is not incremental.",
             "type": "string"
           },
           "size": {
@@ -9706,11 +9746,6 @@ func init() {
           "x-omitempty": true,
           "$ref": "#/definitions/ReplicationAsyncConfig"
         },
-        "asyncEnabled": {
-          "description": "Enable asynchronous replication (default: ` + "`" + `false` + "`" + `).",
-          "type": "boolean",
-          "x-omitempty": false
-        },
         "deletionStrategy": {
           "description": "Conflict resolution strategy for deleted objects.",
           "type": "string",
@@ -10984,7 +11019,7 @@ func init() {
       "url": "https://github.com/weaviate",
       "email": "hello@weaviate.io"
     },
-    "version": "1.38.0-dev"
+    "version": "1.39.0-dev"
   },
   "basePath": "/v1",
   "paths": {
@@ -12012,6 +12047,9 @@ func init() {
               "$ref": "#/definitions/ErrorResponse"
             }
           },
+          "404": {
+            "description": "No role found."
+          },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request.",
             "schema": {
@@ -12209,6 +12247,12 @@ func init() {
           },
           "404": {
             "description": "No role found."
+          },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
           },
           "500": {
             "description": "An error has occurred while trying to fulfill the request. Most likely the ErrorResponse will contain more information about the error.",
@@ -12412,6 +12456,12 @@ func init() {
           },
           "404": {
             "description": "No roles found for specified user."
+          },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
           },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request.",
@@ -14901,6 +14951,12 @@ func init() {
           "404": {
             "description": "Source object not found."
           },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request. Ensure the property exists and is a reference type.",
             "schema": {
@@ -14994,6 +15050,12 @@ func init() {
           "404": {
             "description": "Source object not found."
           },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
           "422": {
             "description": "The request syntax is correct, but the server couldn't process it due to semantic issues. Please check the values in your request. Ensure the property exists and is a reference type.",
             "schema": {
@@ -15086,6 +15148,12 @@ func init() {
           },
           "404": {
             "description": "Object or reference not found.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
+          },
+          "410": {
+            "description": "Endpoint not available in the current cluster configuration.",
             "schema": {
               "$ref": "#/definitions/ErrorResponse"
             }
@@ -16718,7 +16786,10 @@ func init() {
             }
           },
           "404": {
-            "description": "Collection or property not found."
+            "description": "Collection or property not found. cancel:true with nothing to cancel returns 202 with Status: NO_OP instead — 404 is reserved for missing collection/property.",
+            "schema": {
+              "$ref": "#/definitions/ErrorResponse"
+            }
           },
           "409": {
             "description": "Conflicting reindex task already running.",
@@ -17714,10 +17785,6 @@ func init() {
                   "description": "EXPERIMENTAL, DONT USE. THIS WILL BE REMOVED AGAIN. - import api key from static user",
                   "type": "boolean",
                   "default": false
-                },
-                "namespace": {
-                  "description": "Namespace to bind the new user to. Required on namespace-enabled clusters. Must be set by a global operator only.",
-                  "type": "string"
                 }
               }
             }
@@ -18278,6 +18345,10 @@ func init() {
           "description": "The ID of the backup. Must be URL-safe and work as a filesystem path, only lowercase, numbers, underscore, minus characters allowed.",
           "type": "string"
         },
+        "incremental_base_backup_id": {
+          "description": "The ID of the base backup this incremental backup was built on; empty if the backup is not incremental.",
+          "type": "string"
+        },
         "path": {
           "description": "Destination path of backup files valid for the selected backend.",
           "type": "string"
@@ -18333,6 +18404,10 @@ func init() {
         },
         "id": {
           "description": "The ID of the backup. Must be URL-safe and work as a filesystem path, only lowercase, numbers, underscore, minus characters allowed.",
+          "type": "string"
+        },
+        "incremental_base_backup_id": {
+          "description": "The ID of the base backup this incremental backup was built on; empty if the backup is not incremental.",
           "type": "string"
         },
         "size": {
@@ -21108,11 +21183,6 @@ func init() {
           "description": "Configuration parameters for asynchronous replication.",
           "x-omitempty": true,
           "$ref": "#/definitions/ReplicationAsyncConfig"
-        },
-        "asyncEnabled": {
-          "description": "Enable asynchronous replication (default: ` + "`" + `false` + "`" + `).",
-          "type": "boolean",
-          "x-omitempty": false
         },
         "deletionStrategy": {
           "description": "Conflict resolution strategy for deleted objects.",

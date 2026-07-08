@@ -188,7 +188,7 @@ func runLiveQueryDuringChangeTokenizationCase(
 
 	className := fmt.Sprintf("LiveQueryTok_%s_%s_%s", startTok, targetTok, indexType)
 
-	createCollection(t, compose.GetWeaviateNode(1).URI(), className, shardCount, rf,
+	createCollection(t, compose, compose.GetWeaviateNode(1).URI(), className, shardCount, rf,
 		[]*models.Property{
 			{Name: "text", DataType: []string{"text"}, Tokenization: startTok},
 		})
@@ -240,7 +240,7 @@ func runLiveQueryDuringChangeTokenizationCase(
 			require.Eventually(t, func() bool {
 				return tryGetPropertyTokenization(compose.GetWeaviateNode(1).URI(),
 					className, "text") == targetTok
-			}, 60*time.Second, 200*time.Millisecond,
+			}, 60*time.Second, 50*time.Millisecond,
 				"tokenization should change to %s after swap phase", targetTok)
 		})
 	t.Logf("migration completed in %v, collected %d probe samples",
@@ -415,7 +415,7 @@ func TestPartialResultsDuringChangeTokenization(t *testing.T) {
 		queryLimit  = 2000 // Must exceed objectCount so all matches are returned.
 	)
 
-	createCollection(t, compose.GetWeaviateNode(1).URI(), className, shardCount, rf,
+	createCollection(t, compose, compose.GetWeaviateNode(1).URI(), className, shardCount, rf,
 		[]*models.Property{
 			{Name: "text", DataType: []string{"text"}, Tokenization: "word"},
 		})
@@ -434,10 +434,19 @@ func TestPartialResultsDuringChangeTokenization(t *testing.T) {
 	batchImport(t, compose.GetWeaviateNode(1).URI(), className, texts, batchSize)
 
 	// Baseline: WORD tokenization, "alpha" should return all docs.
-	baselineCount := mustQueryBM25Count(t,
-		compose.GetWeaviateNode(1).URI(), className, alphaQuery, queryLimit)
-	require.Equal(t, objectCount, baselineCount,
-		"baseline BM25 'alpha' under WORD tokenization should match all %d docs", objectCount)
+	// Eventually-poll rather than asserting immediately so a narrow
+	// post-batch indexing-visibility race in a replicated cluster
+	// (one doc still propagating when the query lands) doesn't flag
+	// a phantom regression — the assertion still fails fast if the
+	// count never reaches objectCount.
+	var baselineCount int
+	require.Eventuallyf(t, func() bool {
+		baselineCount = mustQueryBM25Count(t,
+			compose.GetWeaviateNode(1).URI(), className, alphaQuery, queryLimit)
+		return baselineCount == objectCount
+	}, 10*time.Second, 50*time.Millisecond,
+		"baseline BM25 'alpha' under WORD tokenization should match all %d docs (last seen=%d)",
+		objectCount, baselineCount)
 	t.Logf("baseline 'alpha' result count: %d", baselineCount)
 
 	probe := func(uri, cn string) (int, error) {
@@ -454,7 +463,7 @@ func TestPartialResultsDuringChangeTokenization(t *testing.T) {
 			require.Eventually(t, func() bool {
 				return tryGetPropertyTokenization(compose.GetWeaviateNode(1).URI(),
 					className, "text") == "field"
-			}, 60*time.Second, 200*time.Millisecond,
+			}, 60*time.Second, 50*time.Millisecond,
 				"tokenization should change to field after swap phase")
 		})
 	t.Logf("migration completed in %v, collected %d probe samples",

@@ -24,6 +24,7 @@ import (
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 
 	"github.com/weaviate/weaviate/entities/backup"
 	"github.com/weaviate/weaviate/entities/models"
@@ -198,13 +199,37 @@ func TestSchedulerBackupStatus(t *testing.T) {
 	)
 
 	t.Run("ActiveState", func(t *testing.T) {
-		s := newFakeScheduler(nil).scheduler()
+		fs := newFakeScheduler(nil)
+		s := fs.scheduler()
 		s.backupper.lastOp.reqState = reqState{
 			Starttime: starTime,
 			ID:        id,
 			Status:    backup.Transferring,
 			Path:      path,
 		}
+		// In-flight backup: meta has not yet been persisted, so the meta read
+		// that backs authorizeBackupByID returns ErrNotFound and is a no-op.
+		// OnStatus then short-circuits on lastOp.
+		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return(nil, backup.ErrNotFound{})
+		fs.backend.On("GetObject", ctx, id, BackupFile).Return(nil, backup.ErrNotFound{})
+		st, err := s.BackupStatus(ctx, nil, backendName, id, "", "")
+		assert.Nil(t, err)
+		assert.Equal(t, want, st)
+	})
+
+	t.Run("ActiveStatePartialMeta", func(t *testing.T) {
+		fs := newFakeScheduler(nil)
+		s := fs.scheduler()
+		s.backupper.lastOp.reqState = reqState{
+			Starttime: starTime,
+			ID:        id,
+			Status:    backup.Transferring,
+			Path:      path,
+		}
+		// A status poll racing an in-progress meta write reads a partial file
+		// that fails to unmarshal; authz must tolerate it so the poll succeeds.
+		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return([]byte("{"), nil)
+		fs.backend.On("GetObject", ctx, id, BackupFile).Return(nil, backup.ErrNotFound{})
 		st, err := s.BackupStatus(ctx, nil, backendName, id, "", "")
 		assert.Nil(t, err)
 		assert.Equal(t, want, st)
@@ -219,7 +244,7 @@ func TestSchedulerBackupStatus(t *testing.T) {
 
 	t.Run("MetadataNotFound", func(t *testing.T) {
 		fs := newFakeScheduler(nil)
-		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return(nil, ErrAny)
+		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return(nil, backup.ErrNotFound{})
 		fs.backend.On("GetObject", ctx, id, BackupFile).Return(nil, backup.ErrNotFound{})
 
 		_, err := fs.scheduler().BackupStatus(ctx, nil, backendName, id, "", "")
@@ -228,6 +253,17 @@ func TestSchedulerBackupStatus(t *testing.T) {
 		if !errors.As(err, &nerr) {
 			t.Errorf("error want=%v got=%v", nerr, err)
 		}
+	})
+
+	t.Run("MetadataReadFails", func(t *testing.T) {
+		// A transient/operational read failure propagates raw so the handler
+		// default arm maps it to 500 instead of misclassifying as 404.
+		fs := newFakeScheduler(nil)
+		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return(nil, ErrAny)
+		fs.backend.On("GetObject", ctx, id, BackupFile).Return(nil, ErrAny)
+
+		_, err := fs.scheduler().BackupStatus(ctx, nil, backendName, id, "", "")
+		assert.ErrorIs(t, err, ErrAny, "underlying backend error should propagate unwrapped")
 	})
 
 	t.Run("ReadFromMetadata", func(t *testing.T) {
@@ -240,7 +276,8 @@ func TestSchedulerBackupStatus(t *testing.T) {
 				Status: backup.Success,
 				// 2.5Gb
 				PreCompressionSizeBytes: 2684354560,
-			})
+			},
+		)
 		want := want
 		want.CompletedAt = completedAt
 		want.Status = backup.Success
@@ -294,13 +331,35 @@ func TestSchedulerRestorationStatus(t *testing.T) {
 	)
 
 	t.Run("ActiveState", func(t *testing.T) {
-		s := newFakeScheduler(nil).scheduler()
+		fs := newFakeScheduler(nil)
+		s := fs.scheduler()
 		s.restorer.lastOp.reqState = reqState{
 			Starttime: starTime,
 			ID:        id,
 			Status:    backup.Transferring,
 			Path:      path,
 		}
+		// In-flight restore: meta has not yet been persisted, so the meta read
+		// that backs authorizeBackupByID returns ErrNotFound and is a no-op.
+		// OnStatus then short-circuits on lastOp.
+		fs.backend.On("GetObject", ctx, id, GlobalRestoreFile).Return(nil, backup.ErrNotFound{})
+		st, err := s.RestorationStatus(ctx, nil, backendName, id, "", "")
+		assert.Nil(t, err)
+		assert.Equal(t, want, st)
+	})
+
+	t.Run("ActiveStatePartialMeta", func(t *testing.T) {
+		fs := newFakeScheduler(nil)
+		s := fs.scheduler()
+		s.restorer.lastOp.reqState = reqState{
+			Starttime: starTime,
+			ID:        id,
+			Status:    backup.Transferring,
+			Path:      path,
+		}
+		// A status poll racing an in-progress meta write reads a partial file
+		// that fails to unmarshal; authz must tolerate it so the poll succeeds.
+		fs.backend.On("GetObject", ctx, id, GlobalRestoreFile).Return([]byte("{"), nil)
 		st, err := s.RestorationStatus(ctx, nil, backendName, id, "", "")
 		assert.Nil(t, err)
 		assert.Equal(t, want, st)
@@ -315,13 +374,22 @@ func TestSchedulerRestorationStatus(t *testing.T) {
 
 	t.Run("MetadataNotFound", func(t *testing.T) {
 		fs := newFakeScheduler(nil)
-		fs.backend.On("GetObject", ctx, id, GlobalRestoreFile).Return(nil, ErrAny)
+		fs.backend.On("GetObject", ctx, id, GlobalRestoreFile).Return(nil, backup.ErrNotFound{})
 		_, err := fs.scheduler().RestorationStatus(ctx, nil, backendName, id, "", "")
 		assert.NotNil(t, err)
 		nerr := backup.ErrNotFound{}
 		if !errors.As(err, &nerr) {
 			t.Errorf("error want=%v got=%v", nerr, err)
 		}
+	})
+
+	t.Run("MetadataReadFails", func(t *testing.T) {
+		// A transient/operational read failure propagates raw so the handler
+		// default arm maps it to 500 instead of misclassifying as 404.
+		fs := newFakeScheduler(nil)
+		fs.backend.On("GetObject", ctx, id, GlobalRestoreFile).Return(nil, ErrAny)
+		_, err := fs.scheduler().RestorationStatus(ctx, nil, backendName, id, "", "")
+		assert.ErrorIs(t, err, ErrAny, "underlying backend error should propagate unwrapped")
 	})
 
 	t.Run("ReadFromMetadata", func(t *testing.T) {
@@ -426,7 +494,8 @@ func TestSchedulerCreateBackup(t *testing.T) {
 		fs.backend.On("GetObject", ctx, backupID, GlobalBackupFile).Return(nil, backup.NewErrNotFound(errors.New("not found")))
 		fs.backend.On("GetObject", ctx, backupID, BackupFile).Return(nil, backup.ErrNotFound{})
 
-		fs.backend.On("Initialize", ctx, backupID).Return(errors.New("init meta failed"))
+		initErr := errors.New("init meta failed")
+		fs.backend.On("Initialize", ctx, backupID).Return(initErr)
 		meta, err := fs.scheduler().Backup(ctx, nil, &BackupRequest{
 			Backend: backendName,
 			ID:      backupID,
@@ -435,8 +504,8 @@ func TestSchedulerCreateBackup(t *testing.T) {
 
 		assert.Nil(t, meta)
 		assert.NotNil(t, err)
-		assert.Contains(t, err.Error(), "init")
-		assert.IsType(t, backup.ErrUnprocessable{}, err)
+		assert.ErrorIs(t, err, initErr, "underlying init error should propagate unwrapped")
+		assert.Contains(t, err.Error(), "init uploader")
 	})
 
 	t.Run("Success", func(t *testing.T) {
@@ -642,6 +711,41 @@ func TestSchedulerRestoration(t *testing.T) {
 		restore(fs)
 		assert.Equal(t, fs.backend.glMeta.Status, backup.Success)
 		assert.Contains(t, fs.backend.glMeta.Error, "")
+	})
+
+	t.Run("SuccessWithBaseBackup", func(t *testing.T) {
+		baseID := "base-1"
+		metaWithBase := meta
+		metaWithBase.CompressionType = backup.CompressionGZIP
+		metaWithBase.BaseBackupID = baseID
+		baseMeta := backup.DistributedBackupDescriptor{
+			ID:              baseID,
+			Status:          backup.Success,
+			CompressionType: backup.CompressionGZIP,
+		}
+
+		fs := newFakeScheduler(newFakeNodeResolver([]string{nodeA, nodeB}))
+		bytes := marshalCoordinatorMeta(metaWithBase)
+		fs.backend.On("Initialize", ctx, mock.Anything).Return(nil)
+		fs.backend.On("GetObject", ctx, backupID, GlobalBackupFile).Return(bytes, nil)
+		fs.backend.On("GetObject", ctx, backupID, GlobalRestoreFile).Return(bytes, nil)
+		fs.backend.On("GetObject", ctx, baseID, GlobalBackupFile).Return(marshalCoordinatorMeta(baseMeta), nil)
+		fs.backend.On("GetObject", ctx, keyNodeA, BackupFile).Return(metaBytes1, nil)
+		fs.backend.On("GetObject", ctx, keyNodeB, BackupFile).Return(metaBytes2, nil)
+		fs.backend.On("HomeDir", mock.Anything, mock.Anything, mock.Anything).Return(path)
+		fs.backend.On("PutObject", mock.Anything, mock.Anything, GlobalRestoreFile, mock.AnythingOfType("[]uint8")).Return(nil)
+		fs.client.On("CanCommit", any, nodeA, any).Return(cResp, nil)
+		fs.client.On("Commit", any, nodeA, sReq).Return(nil)
+		fs.client.On("Status", any, nodeA, sReq).Return(sresp, nil)
+		fs.client.On("CanCommit", any, nodeB, any).Return(cResp, nil)
+		fs.client.On("Commit", any, nodeB, sReq).Return(nil)
+		fs.client.On("Status", any, nodeB, sReq).Return(sresp, nil)
+
+		s := fs.scheduler()
+		req := BackupRequest{ID: backupID, Include: []string{cls}, Backend: backendName}
+		resp, err := s.Restore(ctx, nil, &req, false)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
 	})
 
 	t.Run("NodeMappingPassedCorrectly", func(t *testing.T) {
@@ -876,6 +980,15 @@ func TestSchedulerRestoreRequestValidation(t *testing.T) {
 		assert.NotNil(t, err)
 		assert.IsType(t, backup.ErrUnprocessable{}, err)
 		assert.Contains(t, err.Error(), "wrong backup file")
+
+		assert.Contains(t, err.Error(), req.ID,
+			"error must surface the request ID")
+		assert.Contains(t, err.Error(), "123",
+			"error must surface the metadata's stored ID")
+		assert.Contains(t, err.Error(), GlobalBackupFile,
+			"error must name the descriptor file path")
+		assert.Contains(t, err.Error(), path,
+			"error must include the destination path")
 	})
 
 	t.Run("UnknownClass", func(t *testing.T) {
@@ -899,6 +1012,39 @@ func TestSchedulerRestoreRequestValidation(t *testing.T) {
 		assert.NotNil(t, err)
 		assert.Contains(t, err.Error(), cls)
 	})
+
+	t.Run("MissingBaseBackup", func(t *testing.T) {
+		fs := newFakeScheduler(nil)
+		metaWithBase := meta
+		metaWithBase.CompressionType = backup.CompressionGZIP
+		metaWithBase.BaseBackupID = "base-1"
+		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return(marshalCoordinatorMeta(metaWithBase), nil)
+		fs.backend.On("GetObject", ctx, "base-1", GlobalBackupFile).Return(nil, backup.ErrNotFound{})
+		fs.backend.On("HomeDir", mock.Anything, mock.Anything, mock.Anything).Return(path)
+		_, err := fs.scheduler().Restore(ctx, nil, req, false)
+		require.Error(t, err)
+		assert.IsType(t, backup.ErrUnprocessable{}, err)
+		assert.ErrorContains(t, err, "resolve base backup chain")
+	})
+
+	t.Run("BaseBackupNotSuccessful", func(t *testing.T) {
+		fs := newFakeScheduler(nil)
+		metaWithBase := meta
+		metaWithBase.CompressionType = backup.CompressionGZIP
+		metaWithBase.BaseBackupID = "base-1"
+		baseMeta := backup.DistributedBackupDescriptor{
+			ID:              "base-1",
+			Status:          backup.Failed,
+			CompressionType: backup.CompressionGZIP,
+		}
+		fs.backend.On("GetObject", ctx, id, GlobalBackupFile).Return(marshalCoordinatorMeta(metaWithBase), nil)
+		fs.backend.On("GetObject", ctx, "base-1", GlobalBackupFile).Return(marshalCoordinatorMeta(baseMeta), nil)
+		fs.backend.On("HomeDir", mock.Anything, mock.Anything, mock.Anything).Return(path)
+		_, err := fs.scheduler().Restore(ctx, nil, req, false)
+		require.Error(t, err)
+		assert.IsType(t, backup.ErrUnprocessable{}, err)
+		assert.ErrorContains(t, err, "resolve base backup chain")
+	})
 }
 
 func TestSchedulerList(t *testing.T) {
@@ -916,14 +1062,17 @@ func TestSchedulerList(t *testing.T) {
 	t.Run("BackendNotFound", func(t *testing.T) {
 		fs := newFakeScheduler(nil)
 		fs.backendErr = ErrAny
-		_, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering)
+		_, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering, false)
 		assert.NotNil(t, err)
+		assert.ErrorAs(t, err, &backup.ErrUnprocessable{}, "missing backend module should map to 422 unprocessable")
+		assert.Contains(t, err.Error(), backendName)
+		assert.Contains(t, err.Error(), ErrAny.Error())
 	})
 
 	t.Run("AllBackupsFails", func(t *testing.T) {
 		fs := newFakeScheduler(nil)
 		fs.backend.On("AllBackups", mock.Anything).Return(nil, ErrAny)
-		_, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering)
+		_, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering, false)
 		assert.NotNil(t, err)
 		assert.Equal(t, ErrAny, err)
 	})
@@ -938,6 +1087,7 @@ func TestSchedulerList(t *testing.T) {
 					"node1": {Classes: []string{cls1}},
 				},
 				PreCompressionSizeBytes: 16106127360, // 15 GB
+				BaseBackupID:            "base-1",
 			},
 			{
 				ID:     backupID2,
@@ -946,11 +1096,12 @@ func TestSchedulerList(t *testing.T) {
 					"node2": {Classes: []string{cls2}},
 				},
 				PreCompressionSizeBytes: 2147483648, // 2 GB
+				BaseBackupID:            "base-2",
 			},
 		}
 		fs.backend.On("AllBackups", mock.Anything).Return(backups, nil)
 
-		resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering)
+		resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering, true)
 		assert.Nil(t, err)
 		assert.NotNil(t, resp)
 		assert.Len(t, *resp, 2)
@@ -960,19 +1111,38 @@ func TestSchedulerList(t *testing.T) {
 		assert.Equal(t, string(backup.Success), (*resp)[0].Status)
 		assert.Equal(t, []string{cls1}, (*resp)[0].Classes)
 		assert.Equal(t, float64(15), (*resp)[0].Size)
+		assert.Equal(t, "base-1", (*resp)[0].IncrementalBaseBackupID)
 
 		// Check second backup
 		assert.Equal(t, backupID2, (*resp)[1].ID)
 		assert.Equal(t, string(backup.Failed), (*resp)[1].Status)
 		assert.Equal(t, []string{cls2}, (*resp)[1].Classes)
 		assert.Equal(t, float64(2), (*resp)[1].Size)
+		assert.Equal(t, "base-2", (*resp)[1].IncrementalBaseBackupID)
+	})
+
+	t.Run("BaseBackupIDHiddenWhenNotIncluded", func(t *testing.T) {
+		fs := newFakeScheduler(nil)
+		backups := []*backup.DistributedBackupDescriptor{
+			{
+				ID:           backupID1,
+				Status:       backup.Success,
+				BaseBackupID: "base-1",
+			},
+		}
+		fs.backend.On("AllBackups", mock.Anything).Return(backups, nil)
+
+		resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering, false)
+		require.NoError(t, err)
+		require.Len(t, *resp, 1)
+		assert.Empty(t, (*resp)[0].IncrementalBaseBackupID)
 	})
 
 	t.Run("EmptyList", func(t *testing.T) {
 		fs := newFakeScheduler(nil)
 		fs.backend.On("AllBackups", mock.Anything).Return([]*backup.DistributedBackupDescriptor{}, nil)
 
-		resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering)
+		resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering, false)
 		assert.Nil(t, err)
 		assert.NotNil(t, resp)
 		assert.Len(t, *resp, 0)
@@ -1017,7 +1187,7 @@ func TestSchedulerList(t *testing.T) {
 		fs.backend.On("AllBackups", mock.Anything).Return(backups, nil)
 
 		t.Run("return results sorted by default (desc)", func(t *testing.T) {
-			resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering)
+			resp, err := fs.scheduler().List(ctx, nil, backendName, defaultListOrdering, false)
 			assert.Nil(t, err)
 			assert.NotNil(t, resp)
 			assert.Len(t, *resp, 5)
@@ -1036,7 +1206,7 @@ func TestSchedulerList(t *testing.T) {
 		})
 
 		t.Run("return results sorted (asc)", func(t *testing.T) {
-			resp, err := fs.scheduler().List(ctx, nil, backendName, func(s string) *string { return &s }("asc"))
+			resp, err := fs.scheduler().List(ctx, nil, backendName, func(s string) *string { return &s }("asc"), false)
 			assert.Nil(t, err)
 			assert.NotNil(t, resp)
 			assert.Len(t, *resp, 5)
@@ -1146,6 +1316,35 @@ func TestCancellingBackup(t *testing.T) {
 		err = fakeScheduler.scheduler().Cancel(ctx, nil, backendName, "abc", "", "")
 		assert.NotNil(t, err)
 		assert.Equal(t, fmt.Sprintf("backup %q already succeeded", backupID), err.Error())
+		fakeScheduler.backend.AssertExpectations(t)
+	})
+
+	t.Run("PartialMetaRetriesAndScopesAuthz", func(t *testing.T) {
+		fakeScheduler := newFakeScheduler(nil)
+		ds := backup.DistributedBackupDescriptor{
+			Status: backup.Cancelled,
+			Nodes:  map[string]*backup.NodeDescriptor{"node1": {Classes: []string{"Class1"}}},
+		}
+		b, err := json.Marshal(ds)
+		assert.NoError(t, err)
+
+		// First read races an in-progress meta write and returns a partial file;
+		// the retry resolves the real meta so authz is scoped to the backup's
+		// classes instead of a wildcard DELETE that a scoped caller would fail.
+		fakeScheduler.backend.On("GetObject", mock.Anything, backupID, GlobalBackupFile).Return([]byte("{"), nil).Once()
+		fakeScheduler.backend.On("GetObject", mock.Anything, backupID, GlobalBackupFile).Return(b, nil)
+		// The partial GlobalBackupFile read triggers the old-format fallback; deny it
+		// so the json.SyntaxError surfaces and the read is retried.
+		fakeScheduler.backend.On("GetObject", mock.Anything, backupID, BackupFile).Return(nil, backup.ErrNotFound{})
+		fakeScheduler.backend.On("Initialize", mock.Anything, mock.Anything).Return(nil)
+
+		err = fakeScheduler.scheduler().Cancel(ctx, nil, backendName, backupID, "", "")
+		assert.NoError(t, err)
+
+		calls := fakeScheduler.auth.(*mocks.FakeAuthorizer).Calls()
+		assert.Len(t, calls, 1)
+		assert.Equal(t, authorization.DELETE, calls[0].Verb)
+		assert.Equal(t, authorization.Backups("Class1"), calls[0].Resources)
 		fakeScheduler.backend.AssertExpectations(t)
 	})
 }
@@ -1377,5 +1576,31 @@ func TestCancellingRestore(t *testing.T) {
 		assert.Nil(t, err) // Should return nil - let another coordinator handle it
 		// Should NOT call Abort since we couldn't claim cancellation
 		fakeScheduler.client.AssertNotCalled(t, "Abort", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("PartialMetaRetriesAndScopesAuthz", func(t *testing.T) {
+		fakeScheduler := newFakeScheduler(nil)
+		ds := backup.DistributedBackupDescriptor{
+			Status: backup.Cancelled,
+			Nodes:  map[string]*backup.NodeDescriptor{"node1": {Classes: []string{"Class1"}}},
+		}
+		b, err := json.Marshal(ds)
+		assert.NoError(t, err)
+
+		// First read races an in-progress meta write and returns a partial file;
+		// the retry resolves the real meta so authz is scoped to the backup's
+		// classes instead of a wildcard DELETE that a scoped caller would fail.
+		fakeScheduler.backend.On("GetObject", mock.Anything, backupID, GlobalRestoreFile).Return([]byte("{"), nil).Once()
+		fakeScheduler.backend.On("GetObject", mock.Anything, backupID, GlobalRestoreFile).Return(b, nil)
+		fakeScheduler.backend.On("Initialize", mock.Anything, mock.Anything).Return(nil)
+
+		err = fakeScheduler.scheduler().CancelRestore(ctx, nil, backendName, backupID, "", "")
+		assert.NoError(t, err)
+
+		calls := fakeScheduler.auth.(*mocks.FakeAuthorizer).Calls()
+		assert.Len(t, calls, 1)
+		assert.Equal(t, authorization.DELETE, calls[0].Verb)
+		assert.Equal(t, authorization.Backups("Class1"), calls[0].Resources)
+		fakeScheduler.backend.AssertExpectations(t)
 	})
 }

@@ -15,15 +15,10 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"os"
-	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/weaviate/weaviate/entities/loadlimiter"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/pkg/errors"
@@ -36,8 +31,9 @@ import (
 	"github.com/weaviate/weaviate/cluster/replication/types"
 	usagetypes "github.com/weaviate/weaviate/cluster/usage/types"
 	"github.com/weaviate/weaviate/cluster/utils"
-	"github.com/weaviate/weaviate/entities/backup"
 	enterrors "github.com/weaviate/weaviate/entities/errors"
+	"github.com/weaviate/weaviate/entities/loadlimiter"
+	"github.com/weaviate/weaviate/entities/models"
 	"github.com/weaviate/weaviate/entities/replication"
 	"github.com/weaviate/weaviate/entities/schema"
 	"github.com/weaviate/weaviate/entities/storobj"
@@ -67,6 +63,7 @@ type DB struct {
 	indexCheckpoints          *indexcheckpoint.Checkpoints
 	shutdown                  chan struct{}
 	startupComplete           atomic.Bool
+	startupProgress           atomic.Pointer[StartupProgressSnapshot]
 	resourceScanState         *resourceScanState
 	memMonitor                *memwatch.Monitor
 
@@ -111,6 +108,26 @@ type DB struct {
 	nodeSelector   cluster.NodeSelector
 	schemaReader   schemaUC.SchemaReader
 	replicationFSM types.ReplicationFSMReader
+
+	// reindexAuditMu guards the audit deps installed by
+	// [DB.SetReindexAuditDeps] and the backup-gate activity lookup
+	// installed by [DB.SetShardReindexActivityLookup] so they are
+	// safely visible from any post-restore goroutine.
+	//
+	// reindexAuditDeferredRequests counts the number of times
+	// [DB.AuditOrphanReindexTrackersIfReady] was called BEFORE deps
+	// were installed (typically from the per-class-dir restore hook
+	// firing during RAFT replay while the SetReindexAuditDeps
+	// goroutine is still waiting on metaStoreReady). On the first
+	// SetReindexAuditDeps call, if the counter is non-zero, the
+	// install path runs a single replay sweep so the deferred
+	// per-class audits are not silently lost. Closes B2.
+	reindexAuditMu                     sync.RWMutex
+	reindexAuditLookupBuilder          KnownReindexTaskLookupBuilder
+	reindexAuditLogger                 logrus.FieldLogger
+	reindexAuditDeferredRequests       int
+	shardReindexActivityLookupBuilder  ShardReindexActivityLookupBuilder
+	reindexCleanupInProgressLookupBldr CleanupInProgressLookupBuilder
 
 	bitmapBufPool      roaringset.BitmapBufPool
 	bitmapBufPoolClose func()
@@ -157,6 +174,9 @@ func (db *DB) GetScheduler() *queue.Scheduler {
 }
 
 func (db *DB) WaitForStartup(ctx context.Context) error {
+	stop := db.trackStartupProgress(ctx)
+	defer stop()
+
 	err := db.init(ctx)
 	if err != nil {
 		return err
@@ -169,6 +189,125 @@ func (db *DB) WaitForStartup(ctx context.Context) error {
 }
 
 func (db *DB) StartupComplete() bool { return db.startupComplete.Load() }
+
+const startupProgressUpdateInterval = 5 * time.Second
+
+// StartupProgressSnapshot is a consistent reading of eager shard-loading progress
+type StartupProgressSnapshot struct {
+	Loaded int64
+	Total  int64
+}
+
+// StartupLoadingProgress reports the most recently computed eager shard-loading
+// progress: how many eagerly-loaded local shards have finished loading (loaded)
+// against how many are expected to load eagerly (total).
+func (db *DB) StartupLoadingProgress() *StartupProgressSnapshot {
+	return db.startupProgress.Load()
+}
+
+// trackStartupProgress recomputes eager shard-loading progress on a ticker and
+// caches it. It returns a stop function that halts the ticker and pins the
+// final value; callers should defer it. The goroutine also exits if ctx is done.
+func (db *DB) trackStartupProgress(ctx context.Context) func() {
+	classNames := db.startupClassNames()
+
+	// Publish immediately so a value is available before the first log tick.
+	db.updateStartupProgress(classNames)
+
+	done := make(chan struct{})
+	enterrors.GoWrapper(func() {
+		ticker := time.NewTicker(startupProgressUpdateInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				db.updateStartupProgress(classNames)
+			}
+		}
+	}, db.logger)
+
+	return func() {
+		close(done)
+		// Pin the final value now that loading has finished.
+		db.updateStartupProgress(classNames)
+	}
+}
+
+// startupClassNames snapshots the current class names for the startup progress scan
+func (db *DB) startupClassNames() []string {
+	s := db.schemaGetter.GetSchemaSkipAuth()
+	if s.Objects == nil {
+		return nil
+	}
+	names := make([]string, 0, len(s.Objects.Classes))
+	for _, class := range s.Objects.Classes {
+		names = append(names, class.Class)
+	}
+	return names
+}
+
+// updateStartupProgress recomputes progress once and publishes it to the cached
+// snapshot and the Prometheus gauges.
+func (db *DB) updateStartupProgress(classNames []string) {
+	loaded, total := db.scanStartupProgress(classNames)
+	db.startupProgress.Store(&StartupProgressSnapshot{Loaded: loaded, Total: total})
+	db.promMetrics.SetStartupShardProgress(loaded, total)
+}
+
+// scanStartupProgress computes eager shard-loading progress from scratch for the
+// given classes.
+//
+// total starts from every HOT local shard known to the schema (eager and lazy);
+// lazy shards are then discounted as they are encountered in the index maps,
+// leaving the eager total. Safe to call while the DB is still loading.
+func (db *DB) scanStartupProgress(classNames []string) (loaded, total int64) {
+	for _, className := range classNames {
+		total += db.localShardsToLoad(className)
+	}
+
+	db.indexLock.RLock()
+	indices := make([]*Index, 0, len(db.indices))
+	for _, idx := range db.indices {
+		indices = append(indices, idx)
+	}
+	db.indexLock.RUnlock()
+
+	for _, idx := range indices {
+		_ = idx.ForEachShard(func(_ string, shard ShardLike) error {
+			if _, ok := shard.(*LazyLoadShard); ok {
+				total--
+				return nil
+			}
+			loaded++
+			return nil
+		})
+	}
+
+	return loaded, total
+}
+
+// localShardsToLoad returns the number of local shards that count toward eager
+// startup loading for the given class: local physical shards whose activity
+// status is HOT (empty status counts as HOT)
+func (db *DB) localShardsToLoad(className string) int64 {
+	var count int64
+	_ = db.schemaReader.Read(className, true, func(_ *models.Class, state *sharding.State) error {
+		if state == nil {
+			return nil
+		}
+		for name, physical := range state.Physical {
+			if state.IsLocalShard(name) && physical.ActivityStatus() == models.TenantActivityStatusHOT {
+				count++
+			}
+		}
+		return nil
+	})
+	return count
+}
 
 // IndexGetter interface defines the methods that the service uses from db.IndexGetter
 // This allows for better testability by using interfaces instead of concrete types
@@ -200,35 +339,12 @@ func New(logger logrus.FieldLogger, localNodeName string, config Config,
 
 	// delete any leftover indices that were kept for backup purposes. This should only happen after a crash.
 	// Dont return errors here for missing files etc, as we just want to do a best-effort cleanup.
-	dir, err := os.ReadDir(config.RootPath)
-	if err == nil {
-		for _, entry := range dir {
-			if !entry.IsDir() {
-				continue
-			}
-			name := entry.Name()
-			if strings.HasPrefix(name, backup.DeleteMarker) {
-				if err := os.RemoveAll(filepath.Join(config.RootPath, name)); err != nil {
-					return nil, err
-				}
-				logger.WithFields(logrus.Fields{
-					"action":     "startup",
-					"directory":  name,
-					"index_path": filepath.Join(config.RootPath, name),
-					"index":      name[len(backup.DeleteMarker):],
-				}).Info("removed partially deleted index directory: " + name + "Did Weaviate crash?")
-			}
-			if strings.HasPrefix(name, backup.BackupStagingPrefix) {
-				if err := os.RemoveAll(filepath.Join(config.RootPath, name)); err != nil {
-					return nil, err
-				}
-				logger.WithFields(logrus.Fields{
-					"action":    "startup",
-					"directory": name,
-				}).Info("removed orphaned backup staging directory")
-			}
-		}
+	if err := cleanupRootPathOnStartup(config.RootPath, logger); err != nil {
+		return nil, err
 	}
+
+	// resume any .deleteme cleanup that didn't finish before the last shutdown
+	scanAndAsyncDeletePending(config.RootPath, logger)
 
 	asyncReplicationScheduler, err := NewAsyncReplicationScheduler(
 		context.Background(),
@@ -248,7 +364,6 @@ func New(logger logrus.FieldLogger, localNodeName string, config Config,
 		remoteIndex:               remoteIndex,
 		nodeResolver:              nodeResolver,
 		remoteNode:                sharding.NewRemoteNode(nodeResolver, remoteNodesClient),
-		replicaClient:             replicaClient,
 		asyncReplicationScheduler: asyncReplicationScheduler,
 		promMetrics:               promMetrics,
 		shutdown:                  make(chan struct{}),
@@ -265,6 +380,10 @@ func New(logger logrus.FieldLogger, localNodeName string, config Config,
 		bitmapBufPoolClose:        func() {},
 		AsyncIndexingEnabled:      config.AsyncIndexingEnabled,
 	}
+
+	// Serve replication calls targeting the local node in-process instead of
+	// over a loopback round-trip.
+	db.replicaClient = newRoutingReplicationClient(replicaClient, db, nodeResolver, localNodeName)
 
 	if db.maxNumberGoroutines == 0 {
 		return db, errors.New("no workers to add batch-jobs configured.")
@@ -333,6 +452,7 @@ type Config struct {
 	LazyLoadShardSizeThresholdGB        float64
 	ForceFullReplicasSearch             bool
 	TransferInactivityTimeout           time.Duration
+	HaltForTransferTimeout              time.Duration
 	LSMEnableSegmentsChecksumValidation bool
 	LSMSkipWriteClassNameEnabled        bool
 	NamespacesEnabled                   bool
@@ -346,23 +466,19 @@ type Config struct {
 	ObjectsTTLPauseDuration             *configRuntime.DynamicValue[time.Duration]
 	ObjectsTTLConcurrencyFactor         *configRuntime.DynamicValue[float64]
 
-	HNSWMaxLogSize                               int64
-	HNSWDisableSnapshots                         bool
-	HNSWSnapshotIntervalSeconds                  int
-	HNSWSnapshotOnStartup                        bool
-	HNSWSnapshotMinDeltaCommitlogsNumber         int
-	HNSWSnapshotMinDeltaCommitlogsSizePercentage int
-	HNSWWaitForCachePrefill                      bool
-	HNSWFlatSearchConcurrency                    int
-	HNSWAcornFilterRatio                         float64
-	HNSWGeoIndexEF                               int
-	VisitedListPoolMaxSize                       int
+	HNSWMaxLogSize            int64
+	HNSWWaitForCachePrefill   bool
+	HNSWFlatSearchConcurrency int
+	HNSWAcornFilterRatio      float64
+	HNSWGeoIndexEF            int
+	VisitedListPoolMaxSize    int
 
 	TenantActivityReadLogLevel  *configRuntime.DynamicValue[string]
 	TenantActivityWriteLogLevel *configRuntime.DynamicValue[string]
 	QuerySlowLogEnabled         *configRuntime.DynamicValue[bool]
 	QuerySlowLogThreshold       *configRuntime.DynamicValue[time.Duration]
 	InvertedSorterDisabled      *configRuntime.DynamicValue[bool]
+	LazyPropertyLengthsEnabled  *configRuntime.DynamicValue[bool]
 	MaintenanceModeEnabled      func() bool
 	AsyncIndexingEnabled        bool
 
@@ -393,6 +509,28 @@ func (db *DB) GetIndex(className schema.ClassName) *Index {
 	}, utils.NewBackoff())
 
 	return index
+}
+
+// WaitForLocalInflightWrites blocks until this node's in-flight coordinated
+// writes to the given shard have drained, or ctx is done.
+//
+// If the index is not found, or if the index has no replicator (i.e. this node is not a replica for the given shard), this method returns immediately without error.
+func (db *DB) WaitForLocalInflightWrites(ctx context.Context, class, shard string) error {
+	var index *Index
+	if ok := func() bool {
+		db.indexLock.RLock()
+		defer db.indexLock.RUnlock()
+		index = db.indices[indexID(schema.ClassName(class))]
+		if index == nil || index.replicator == nil {
+			return false
+		}
+		index.dropIndex.RLock()
+		return true
+	}(); !ok {
+		return fmt.Errorf("index for class %v not found locally or has no replicator", class)
+	}
+	defer index.dropIndex.RUnlock()
+	return index.replicator.WaitForDrain(ctx, shard)
 }
 
 // GetLocalShardNames returns the names of all shards local to this node for

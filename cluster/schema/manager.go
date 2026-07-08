@@ -26,8 +26,10 @@ import (
 	"github.com/weaviate/weaviate/cluster/distributedtask"
 	command "github.com/weaviate/weaviate/cluster/proto/api"
 	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/modelsext"
 	entSchema "github.com/weaviate/weaviate/entities/schema"
 	"github.com/weaviate/weaviate/usecases/sharding"
+	"github.com/weaviate/weaviate/usecases/usagelimits"
 )
 
 var (
@@ -37,7 +39,8 @@ var (
 )
 
 type replicationFSM interface {
-	HasOngoingReplication(collection string, shard string, replica string) bool
+	HasActiveReplicationForShard(collection, shard string) bool
+	HasActiveReplicationForCollection(collection string) bool
 	DeleteReplicationsByCollection(collection string) error
 	DeleteReplicationsByTenants(collection string, tenants []string) error
 	SetUnCancellable(id uint64) error
@@ -68,6 +71,10 @@ type MutationGuard interface {
 	// conflict — callers must filter via
 	// [tenantsTransitioningAwayFromActive] before invoking.
 	CheckTenantMutation(className string, tenants []string) error
+
+	// CheckVectorConfigRemoval gates removal of dropped ("none") VectorConfig
+	// entries on a completed cleanup task. Returns non-nil to reject.
+	CheckVectorConfigRemoval(className string, removedVectors []string) error
 }
 
 // Narrow slice of *cluster/distributedtask.Manager so schema doesn't
@@ -84,6 +91,11 @@ type SchemaManager struct {
 	replicationFSM         replicationFSM
 	mutationGuard          MutationGuard
 	distributedTaskManager distributedTaskCascadeDeleter
+	// tenantLimit resolves the per-collection tenant cap (negative = unlimited;
+	// nil = unenforced); read pre-commit, never in the FSM apply path.
+	tenantLimit func() int
+	// tenantLimitErrTemplate resolves the cap-exceeded message (empty = default).
+	tenantLimitErrTemplate func() string
 }
 
 func NewSchemaManager(nodeId string, db Indexer, parser Parser, reg prometheus.Registerer, log *logrus.Logger) *SchemaManager {
@@ -138,6 +150,19 @@ func tenantsTransitioningAwayFromActive(tenants []*command.Tenant) []string {
 		}
 	}
 	return affected
+}
+
+// SetTenantLimit installs the tenant-cap resolvers used by PreApplyFilter
+// (negative = unlimited; nil = unenforced). Call once during FSM bootstrap.
+func (s *SchemaManager) SetTenantLimit(limit func() int, errTemplate func() string) {
+	s.tenantLimit = limit
+	s.tenantLimitErrTemplate = errTemplate
+}
+
+// TenantLimitEnforced reports whether a tenant cap is in effect; callers skip
+// the AddTenants serialization when it is not.
+func (s *SchemaManager) TenantLimitEnforced() bool {
+	return s.tenantLimit != nil && s.tenantLimit() >= 0
 }
 
 func (s *SchemaManager) NewSchemaReader() SchemaReader {
@@ -227,6 +252,31 @@ func (s *SchemaManager) PreApplyFilter(req *command.ApplyRequest) error {
 		}
 	}
 
+	// Per-collection tenant cap, enforced pre-commit. store.Execute serializes
+	// AddTenants per class so this count read can't race the apply increment.
+	if req.Type == command.ApplyRequest_TYPE_ADD_TENANT && s.tenantLimit != nil {
+		if maxTenants := s.tenantLimit(); maxTenants >= 0 {
+			atr := &command.AddTenantsRequest{}
+			if err := gproto.Unmarshal(req.SubCommand, atr); err != nil {
+				return fmt.Errorf("%w: %w", ErrBadRequest, err)
+			}
+			incoming := make([]string, 0, len(atr.Tenants))
+			for _, t := range atr.Tenants {
+				if t != nil {
+					incoming = append(incoming, t.Name)
+				}
+			}
+			if current, additions, ok := s.schema.tenantCapUsage(req.Class, incoming); ok &&
+				current+additions > maxTenants {
+				tmpl := ""
+				if s.tenantLimitErrTemplate != nil {
+					tmpl = s.tenantLimitErrTemplate()
+				}
+				return usagelimits.NewLimitExceededError(tmpl, usagelimits.LimitTenants, int64(maxTenants))
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -265,7 +315,7 @@ func (s *SchemaManager) AddClass(cmd *command.ApplyRequest, nodeID string, schem
 	if req.State == nil {
 		return fmt.Errorf("%w: nil sharding state", ErrBadRequest)
 	}
-	// validate xrefs within the class for existence
+	// Validate xref existence. DataType is pre-qualified on NS clusters.
 	for _, prop := range req.Class.Properties {
 		if !entSchema.IsRefDataType(prop.DataType) {
 			// don't need to validate non-xref data types
@@ -363,6 +413,14 @@ func (s *SchemaManager) UpdateClass(cmd *command.ApplyRequest, nodeID string, sc
 			return fmt.Errorf("%w :parse class update: %w", ErrBadRequest, err)
 		}
 
+		// A structural vector change can't be reconciled by an in-flight movement's snapshot+CCL.
+		if s.replicationFSM != nil && s.replicationFSM.HasActiveReplicationForCollection(meta.Class.Class) {
+			if reason := dangerousVectorConfigChange(&meta.Class, u); reason != "" {
+				return fmt.Errorf("%w: %w: %s on collection %q; retry after it completes",
+					ErrBadRequest, ErrReplicaMovementInProgress, reason, meta.Class.Class)
+			}
+		}
+
 		// Capture previous and updated replication factors
 		var initialRF int64
 		if meta.Class.ReplicationConfig != nil {
@@ -384,6 +442,15 @@ func (s *SchemaManager) UpdateClass(cmd *command.ApplyRequest, nodeID string, sc
 						updatedRF,
 						meta.Class.Class,
 					)
+				}
+			}
+		}
+
+		// Gate at apply time so the verdict is RAFT-deterministic.
+		if s.mutationGuard != nil {
+			if removed := removedDroppedVectorConfigs(&meta.Class, u); len(removed) > 0 {
+				if err := s.mutationGuard.CheckVectorConfigRemoval(meta.Class.Class, removed); err != nil {
+					return fmt.Errorf("%w: %w", ErrBadRequest, err)
 				}
 			}
 		}
@@ -420,6 +487,22 @@ func (s *SchemaManager) UpdateClass(cmd *command.ApplyRequest, nodeID string, sc
 			enableSchemaCallback: enableSchemaCallback,
 		},
 	)
+}
+
+// removedDroppedVectorConfigs returns the names of dropped ("none") VectorConfig
+// entries in prev that are absent from next. Only "none" entries: removing a live
+// entry is already rejected by the parser.
+func removedDroppedVectorConfigs(prev, next *models.Class) []string {
+	var removed []string
+	for name, cfg := range prev.VectorConfig {
+		if !modelsext.IsVectorIndexDropped(cfg) {
+			continue
+		}
+		if _, ok := next.VectorConfig[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	return removed
 }
 
 func (s *SchemaManager) DeleteClass(cmd *command.ApplyRequest, schemaOnly bool, enableSchemaCallback bool) error {
@@ -535,6 +618,18 @@ func (s *SchemaManager) UpdateProperty(cmd *command.ApplyRequest, schemaOnly boo
 		}
 	}
 
+	// Disabling an index deletes the property's LSM buckets, which an in-flight movement's
+	// snapshot+CCL can't reconcile. FromInFlightMigration bypasses, as with the reindex guard.
+	if s.replicationFSM != nil && !req.FromInFlightMigration &&
+		s.replicationFSM.HasActiveReplicationForCollection(cmd.Class) {
+		if cls, _ := s.schema.ReadOnlyClass(cmd.Class); cls != nil {
+			if old := findProp(cls, req.Property.Name); old != nil && disablesAnyIndex(old, req.Property) {
+				return fmt.Errorf("%w: %w: property %q index removal blocked on collection %q; retry after it completes",
+					ErrBadRequest, ErrReplicaMovementInProgress, req.Property.Name, cmd.Class)
+			}
+		}
+	}
+
 	return s.apply(
 		applyOp{
 			op: cmd.GetType().String(),
@@ -577,9 +672,11 @@ func (s *SchemaManager) AddReplicaToShard(cmd *command.ApplyRequest, schemaOnly 
 			updateSchema: func() error { return s.schema.addReplicaToShard(cmd.Class, cmd.Version, req.Shard, req.TargetNode) },
 			updateStore: func() error {
 				if req.TargetNode == s.schema.nodeID {
-					return s.db.AddReplicaToShard(req.Class, req.Shard, req.TargetNode)
+					if err := s.db.AddReplicaToShard(req.Class, req.Shard, req.TargetNode); err != nil {
+						return err
+					}
 				}
-				return nil
+				return s.db.ReconcileAsyncReplicationForShard(req.Class, req.Shard)
 			},
 			schemaOnly: schemaOnly,
 		},
@@ -600,9 +697,11 @@ func (s *SchemaManager) DeleteReplicaFromShard(cmd *command.ApplyRequest, schema
 			},
 			updateStore: func() error {
 				if req.TargetNode == s.schema.nodeID {
-					return s.db.DeleteReplicaFromShard(req.Class, req.Shard, req.TargetNode)
+					if err := s.db.DeleteReplicaFromShard(req.Class, req.Shard, req.TargetNode); err != nil {
+						return err
+					}
 				}
-				return nil
+				return s.db.ReconcileAsyncReplicationForShard(req.Class, req.Shard)
 			},
 			schemaOnly: schemaOnly,
 		},
@@ -803,9 +902,11 @@ func (s *SchemaManager) ReplicationAddReplicaToShard(cmd *command.ApplyRequest, 
 			},
 			updateStore: func() error {
 				if req.TargetNode == s.schema.nodeID {
-					return s.db.AddReplicaToShard(req.Class, req.Shard, req.TargetNode)
+					if err := s.db.AddReplicaToShard(req.Class, req.Shard, req.TargetNode); err != nil {
+						return err
+					}
 				}
-				return nil
+				return s.db.ReconcileAsyncReplicationForShard(req.Class, req.Shard)
 			},
 			schemaOnly: schemaOnly,
 		},

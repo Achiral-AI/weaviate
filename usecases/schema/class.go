@@ -153,6 +153,7 @@ func (h *Handler) AddClass(ctx context.Context, principal *models.Principal,
 		}
 	}
 
+	// DataType is pre-qualified; used as-is for authz + schema lookup.
 	classGetterWithAuth := func(name string) (*models.Class, error) {
 		if err := h.Authorizer.Authorize(ctx, principal, authorization.READ, authorization.CollectionsMetadata(name)...); err != nil {
 			return nil, err
@@ -455,7 +456,7 @@ func (h *Handler) UpdateClass(ctx context.Context, principal *models.Principal,
 	// Namespaced callers send the stripped (short) class name in the body
 	// after a GET. Qualify it and require it to match the path so a
 	// mismatch surfaces explicitly instead of being silently overwritten.
-	if updated != nil && principal != nil && principal.Namespace != "" {
+	if updated != nil && namespacing.ConfinedNamespace(principal) != "" {
 		qualifiedBody, err := namespacing.QualifyClass(principal, h.config.Namespaces.Enabled, updated.Class)
 		if err != nil {
 			return fmt.Errorf("%w: %w", ErrValidation, err)
@@ -525,6 +526,20 @@ func UpdateClassInternal(h *Handler, ctx context.Context, className string, upda
 	// Initial class is read up-front for the grandfather-on-tighten skip
 	// in validateVectorSettingsAgainst.
 	initial := h.schemaReader.ReadOnlyClass(className)
+
+	if err := rejectVectorIndexTypeNone(initial, updated); err != nil {
+		vclasses, qErr := h.schemaManager.QueryReadOnlyClasses(className)
+		if qErr != nil {
+			return err
+		}
+		consistent, ok := vclasses[className]
+		if !ok || consistent.Class == nil {
+			return err
+		}
+		if err := rejectVectorIndexTypeNone(consistent.Class, updated); err != nil {
+			return err
+		}
+	}
 
 	if err := h.validateVectorSettingsAgainst(updated, initial); err != nil {
 		return err
@@ -659,7 +674,6 @@ func (m *Handler) setNewClassDefaults(class *models.Class, globalCfg replication
 		class.ReplicationConfig = &models.ReplicationConfig{
 			Factor:           int64(m.config.Replication.MinimumFactor),
 			DeletionStrategy: models.ReplicationConfigDeletionStrategyTimeBasedResolution,
-			AsyncEnabled:     false,
 		}
 		return nil
 	}
@@ -1036,6 +1050,29 @@ func (h *Handler) validateCanAddClass(ctx context.Context, class *models.Class, 
 	}
 
 	return h.validateClassInvariants(ctx, class, originalName, classGetterWithAuth, relaxCrossRefValidation)
+}
+
+// rejectVectorIndexTypeNone rejects a client update that newly introduces the
+// dropped-index sentinel (VectorIndexType=="none"); an existing "none" may
+// persist. That marker is set only server-side by DeleteClassVectorIndex.
+func rejectVectorIndexTypeNone(prev, next *models.Class) error {
+	if next == nil {
+		return nil
+	}
+	for name, nextCfg := range next.VectorConfig {
+		if !modelsext.IsVectorIndexDropped(nextCfg) {
+			continue
+		}
+		if prev != nil {
+			if prevCfg, ok := prev.VectorConfig[name]; ok && modelsext.IsVectorIndexDropped(prevCfg) {
+				continue
+			}
+		}
+		return fmt.Errorf("vector %q: vectorIndexType %q is an internal sentinel for "+
+			"dropped indexes and cannot be set through a class update; use the drop "+
+			"vector index API instead", name, modelsext.VectorIndexTypeNone)
+	}
+	return nil
 }
 
 func (h *Handler) validateClassInvariants(

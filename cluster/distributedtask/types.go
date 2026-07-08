@@ -235,6 +235,19 @@ type SchemaMutationDetector interface {
 	CheckTenantMutation(className string, tenants []string, existingTasks []*Task) error
 }
 
+// VectorConfigRemovalGate is an optional interface a SchemaMutationDetector also
+// implements to gate removal of a dropped ("none") VectorConfig entry: removal
+// is permitted only once a completed cleanup task covers it, so the marker can't
+// vanish before the on-disk vectors are stripped. Dispatched by type assertion
+// from the SchemaMutationDetector registry. Same FSM-determinism contract as
+// [SchemaMutationDetector]: a pure function of its arguments.
+type VectorConfigRemovalGate interface {
+	// CheckVectorConfigRemoval is called under [Manager.mu] from the schema FSM's
+	// UpdateClass apply; non-nil rejects. existingTasks is the namespace-scoped
+	// list at apply time.
+	CheckVectorConfigRemoval(className string, removedVectors []string, existingTasks []*Task) error
+}
+
 // RecoveryAwareProvider is an optional interface providers implement to
 // participate in post-restart callback retry. The Scheduler's bootstrap
 // pre-mark (which normally suppresses replay of callbacks that fired
@@ -298,6 +311,20 @@ type UnitAwareProvider interface {
 	// RecordPostCompletionAck (failure → FAILED, schema flip skipped).
 	OnSwapRequested(task *Task, groupID string, localGroupUnitIDs []string) error
 
+	// OnTaskCompleted is invoked by the [Scheduler] once per task that has
+	// reached a terminal status, after every local unit terminated and
+	// (for unit-aware providers) every per-node post-completion ack
+	// landed. The scheduler MAY re-invoke this method for the same task
+	// if a downstream finalize-record write fails — concretely, when
+	// [TaskFinalizer.MarkDistributedTaskFinalized] returns an error the
+	// rollback path clears the per-task fired-marker so the next tick
+	// re-fires OnTaskCompleted before retrying the finalize. Implementations
+	// MUST therefore be idempotent against repeat calls with the same
+	// (TaskDescriptor, Status): re-running must not double-apply a
+	// destructive side effect (a schema flip reverted, a marker emitted
+	// twice, etc.). Today's concrete provider (db/reindex_provider.go's
+	// OnTaskCompleted → autoCleanupAfterTerminal) already is; new
+	// implementations MUST preserve this contract.
 	OnTaskCompleted(task *Task)
 }
 

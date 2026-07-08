@@ -68,7 +68,7 @@ Submit a migration. Body shape selects which one:
 | `{"searchable":{"rebuild":true}}` | `repair-searchable` | Rebuild the searchable bucket. Also serves as the Map → Blockmax upgrade — `OnMigrationComplete` flips the class-level `UsingBlockMaxWAND` flag once every searchable property has been rebuilt. |
 | `{"filterable":{"rebuild":true}}` | `repair-filterable` | RoaringSet refresh. |
 | `{"rangeable":{"rebuild":true}}` | `repair-rangeable` | RoaringSetRange rebuild. |
-| `{"<type>":{"cancel":true}}` | (cancel verb) | Cancels the in-flight task on `(class, property, indexType)`. 404 if no STARTED task matches. |
+| `{"<type>":{"cancel":true}}` | (cancel verb) | Cancels the in-flight task on `(class, property, indexType)`. Idempotent: 202 + `Status: CANCELLED` when a STARTED task is cancelled, 202 + `Status: NO_OP` when nothing matches (already finished, never submitted, or already cancelled). |
 
 Query parameters:
 
@@ -80,13 +80,15 @@ Query parameters:
 
 Response shapes:
 
-- `202 Accepted` with the new task ID. Poll `GET /indexes` (or DTM API)
-  to observe progress.
+- `202 Accepted` — for submit, body contains the new task ID. For the
+  cancel verb, body is an `IndexUpdateResponse` with `Status: CANCELLED`
+  + `taskId` when a STARTED task was cancelled, or `Status: NO_OP` (no
+  `taskId`) when nothing matched. The cancel verb is idempotent and
+  never returns 404 for "no task to cancel".
 - `400 Bad Request` — validation failure with a structured next-step
   hint (e.g. "property X has no searchable index; use
   `{filterable:{tokenization:...}}` to retokenize the filterable bucket").
-- `404 Not Found` — class or property doesn't exist; cancel target
-  doesn't exist.
+- `404 Not Found` — class or property doesn't exist.
 - `409 Conflict` — an in-flight task already touches this property.
   The error names the offending task ID and migration type.
 - `429 / 503` — per-collection in-flight cap reached (default 32) or
@@ -1094,10 +1096,15 @@ which consults the overlay before falling back to the schema value.
 
 Lifecycle:
 
-1. **Set** — `maybeSetTokenizationOverlayPreSwap` runs in Phase 2 of
-   `OnGroupCompleted`, between PREP and ATOMIC SWAP. Only for
+1. **Set** — `maybeWirePerPropOverlaySet` runs in Phase 2 of
+   `OnGroupCompleted`, between PREP and ATOMIC SWAP, installing a
+   per-prop `onPropSwapped` hook on each task. The overlay for a prop
+   is then SET inside the swap's Phase 2a tight loop, ATOMICALLY with
+   that prop's `store.SwapBucketPointer` flip, not once-for-the-whole-
+   shard up front (which opens a disk-I/O-sized `overlay=NEW`,
+   `bucket=OLD` window across `RunSwapOnShard`'s preamble). Only for
    tokenization-changing migrations (`change-tokenization`,
-   `change-tokenization-filterable`, `enable-searchable`).
+   `change-tokenization-filterable`).
 2. **Cover** — the entire Phase 2 (atomic swap + post-atomic tidy +
    `OnMigrationComplete`) runs with the overlay active. Queries see
    NEW-tokenized analyzer input against NEW-tokenized bucket content.
@@ -1146,13 +1153,19 @@ phases of different concerns and don't share state.
 **Cancel** (`{"<type>":{"cancel":true}}`):
 
 1. Find the STARTED task targeting `(collection, prop, indexType)`.
+   If none matches (already finished, never submitted, or already
+   cancelled), return 202 with `Status: NO_OP` and no `taskId`. The
+   verb is idempotent: caller's `(collection, property)` was already
+   verified to exist by the outer handler, so "nothing to cancel" is
+   surfaced as a no-op rather than overloading 404 with two distinct
+   meanings.
 2. RAFT `CancelDistributedTask`.
 3. Wait for the local reindex goroutine to drain
    (`WaitForLocalTaskDrain`, 10s timeout). Bounded so a stuck
    goroutine doesn't turn the HTTP request into a hang.
 4. `CleanStalePartialReindexState` — wipe sidecars + migration dir
    so the next submit starts from a clean slate.
-5. 202 with the cancelled task ID.
+5. 202 with `Status: CANCELLED` + the cancelled task ID.
 
 If the drain times out, return 202 anyway — the next submit's
 defense-in-depth cleanup will pick up the work. If the node crashes

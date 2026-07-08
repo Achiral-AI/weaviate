@@ -88,6 +88,11 @@ func (s *Store) Bucket(name string) *Bucket {
 	s.bucketAccessLock.RLock()
 	defer s.bucketAccessLock.RUnlock()
 
+	return s.bucketNoLock(name)
+}
+
+// bucketNoLock returns a bucket by name; caller must hold bucketAccessLock.
+func (s *Store) bucketNoLock(name string) *Bucket {
 	return s.bucketsByName[name]
 }
 
@@ -246,6 +251,15 @@ func (s *Store) Shutdown(ctx context.Context) error {
 	return eg.Wait()
 }
 
+// ErrBucketNotFound is the sentinel returned by [Store.ShutdownBucket]
+// when the named bucket is absent at shutdown time. Callers that race
+// against another teardown path (cancel-cleanup, restart-bootstrap) can
+// match this sentinel with [errors.Is] to treat "already gone" as the
+// desired post-state. Callers that genuinely expected the bucket to be
+// present (e.g. the reindex task that just created it) propagate the
+// error normally.
+var ErrBucketNotFound = errors.New("bucket not found")
+
 func (s *Store) ShutdownBucket(ctx context.Context, bucketName string) error {
 	s.closeLock.RLock()
 	defer s.closeLock.RUnlock()
@@ -255,7 +269,7 @@ func (s *Store) ShutdownBucket(ctx context.Context, bucketName string) error {
 
 	bucket, ok := s.bucketsByName[bucketName]
 	if !ok {
-		return fmt.Errorf("shutdown bucket %q of store %q: bucket not found", bucketName, s.dir)
+		return fmt.Errorf("shutdown bucket %q of store %q: %w", bucketName, s.dir, ErrBucketNotFound)
 	}
 	if err := bucket.Shutdown(ctx); err != nil {
 		return errors.Wrapf(err, "shutdown bucket %q of store %q", bucketName, s.dir)

@@ -85,6 +85,9 @@ func TestService_Usage_SingleTenant(t *testing.T) {
 			return fn(nil, shardingState)
 		},
 	)
+	mockSchemaReader.EXPECT().LocalShards(mock.Anything).Return([]string{"shard1"}, nil).Maybe()
+	mockSchemaReader.EXPECT().LocalActiveShardsCount(mock.Anything).Return(1, nil).Maybe()
+	mockSchemaReader.EXPECT().ShardReplicas(mock.Anything, mock.Anything).Return([]string{nodeName}, nil).Maybe()
 
 	mockSchemaGetter := schemaUC.NewMockSchemaGetter(t)
 	mockSchemaGetter.EXPECT().GetSchemaSkipAuth().Return(entschema.Schema{
@@ -211,7 +214,10 @@ func TestService_Usage_MultiTenant_HotAndCold(t *testing.T) {
 			return fn(nil, shardingState)
 		},
 	)
+	mockSchemaReader.EXPECT().LocalShards(mock.Anything).Return([]string{"shard1"}, nil).Maybe()
+	mockSchemaReader.EXPECT().LocalActiveShardsCount(mock.Anything).Return(1, nil).Maybe()
 	mockSchemaReader.EXPECT().LocalActiveShardsCount(className).Return(len(shardingState.Physical), nil)
+	mockSchemaReader.EXPECT().ShardReplicas(mock.Anything, mock.Anything).Return([]string{nodeName}, nil).Maybe()
 
 	repo := createTestDb(t, mockSchema, shardingState, class, nodeName)
 	putObjectAndFlush(t, repo, className, hotTenant, map[string][]float32{vectorName: {0.1, 0.2, 0.3}}, map[string][]float32{vectorName: {0.4, 0.5, 0.6}})
@@ -560,6 +566,7 @@ func TestService_Usage_NilVectorIndexConfig(t *testing.T) {
 			return fn(nil, shardingState)
 		},
 	)
+	mockSchemaReader.EXPECT().ShardReplicas(mock.Anything, mock.Anything).Return([]string{nodeName}, nil).Maybe()
 
 	repo := createTestDb(t, mockSchema, shardingState, class, nodeName)
 	repo.Shutdown(ctx)
@@ -598,8 +605,9 @@ func createTestDb(t *testing.T, sg schemaUC.SchemaGetter, shardingState *shardin
 	mockNodeSelector.EXPECT().LocalName().Return(nodeName).Maybe()
 	mockNodeSelector.EXPECT().NodeHostname(mock.Anything).Return(nodeName, true).Maybe()
 	mockReplicationFSMReader := replicationTypes.NewMockReplicationFSMReader(t)
+	mockReplicationFSMReader.EXPECT().HasActiveReplicationForShard(mock.Anything, mock.Anything).Return(false).Maybe()
 	mockReplicationFSMReader.EXPECT().FilterOneShardReplicasRead(mock.Anything, mock.Anything, mock.Anything).Return([]string{nodeName}).Maybe()
-	mockReplicationFSMReader.EXPECT().FilterOneShardReplicasWrite(mock.Anything, mock.Anything, mock.Anything).Return([]string{nodeName}, nil).Maybe()
+	mockReplicationFSMReader.EXPECT().FilterOneShardReplicasWrite(mock.Anything, mock.Anything, mock.Anything).Return([]string{nodeName}).Maybe()
 	mockSchemaReader := schemaUC.NewMockSchemaReader(t)
 	mockSchemaReader.EXPECT().Shards(mock.Anything).Return(shardingState.AllPhysicalShards(), nil).Maybe()
 	mockSchemaReader.EXPECT().Read(mock.Anything, mock.Anything, mock.Anything).RunAndReturn(func(className string, retryIfClassNotFound bool, readFunc func(*models.Class, *sharding.State) error) error {

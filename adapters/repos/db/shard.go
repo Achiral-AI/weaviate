@@ -103,9 +103,14 @@ type ShardLike interface {
 	ID() string // Get the shard id
 	drop(keepFiles bool) error
 	HaltForTransfer(ctx context.Context, offloading bool, inactivityTimeout time.Duration) error
+	// MayResetTransferInactivityTimer counts external transfer activity
+	// against the halt watchdog. No-op on unhalted shards.
+	MayResetTransferInactivityTimer()
 	initPropertyBuckets(ctx context.Context, eg *enterrors.ErrorGroupWrapper, lazyLoadSegments bool, props ...*models.Property)
 	updatePropertyBuckets(ctx context.Context, eg *enterrors.ErrorGroupWrapper, property *models.Property)
 	CreateBackupSnapshot(ctx context.Context, sd *backup.ShardDescriptor, stagingRoot string) ([]string, error)
+	CreateReplicaSnapshot(ctx context.Context, stagingRoot string) ([]string, error)
+	ListReplicaSnapshotFiles(ctx context.Context, stagingRoot string) ([]string, error)
 	ListBackupFiles(ctx context.Context, ret *backup.ShardDescriptor) ([]string, error)
 	resumeMaintenanceCycles(ctx context.Context) error
 	GetFileMetadata(ctx context.Context, relativeFilePath string) (file.FileMetadata, error)
@@ -115,6 +120,7 @@ type ShardLike interface {
 	AnalyzeObjectForMigrationWithOverlay(*storobj.Object, map[string]inverted.PropertyOverlay) ([]inverted.Property, []inverted.NilProperty, error)
 	Aggregate(ctx context.Context, params aggregation.Params, modules *modules.Provider) (*aggregation.Result, error)
 	HashTreeLevel(ctx context.Context, level int, discriminant *hashtree.Bitset) (digests []hashtree.Digest, err error)
+	HashTreeRoot() (root hashtree.Digest, ok bool)
 	MergeObject(ctx context.Context, object objects.MergeDocument) error
 	VectorDistanceForQuery(ctx context.Context, id uint64, searchVectors []models.Vector, targets []string) ([]float32, error)
 	ConvertQueue(targetVector string) error
@@ -230,6 +236,9 @@ type ShardLike interface {
 type asyncReplicationController interface {
 	enableAsyncReplication(ctx context.Context, config AsyncReplicationConfig) error
 	disableAsyncReplication(ctx context.Context) error
+	// hasActiveAsyncReplicationTargetOverrides reports whether the shard holds
+	// target-node overrides that force async replication on.
+	hasActiveAsyncReplicationTargetOverrides() bool
 }
 
 type onAddToPropertyValueIndex func(shard *Shard, docID uint64, property *inverted.Property) error
@@ -340,11 +349,11 @@ type Shard struct {
 	// Lock ordering when both are needed: asyncReplicationRWMux before asyncReplicationStatsMux.
 	asyncReplicationStatsMux sync.RWMutex
 
-	haltForTransferMux               sync.Mutex
-	haltForTransferInactivityTimeout time.Duration
-	haltForTransferInactivityTimer   *time.Timer
-	haltForTransferCount             int
-	haltForTransferCancel            func()
+	haltForTransferMux                sync.Mutex
+	haltForTransferInactivityTimeout  time.Duration
+	haltForTransferInactivityDeadline time.Time
+	haltForTransferCount              int
+	haltForTransferCtxCancel          context.CancelFunc
 
 	status              ShardStatus
 	statusLock          sync.RWMutex
@@ -417,11 +426,10 @@ type Shard struct {
 	//
 	// Lifecycle (see reindex_provider.go's OnGroupCompleted +
 	// OnTaskCompleted):
-	//   1. SET: pre-swap, just BEFORE the per-task RunSwapOnShard loop
-	//      kicks off on this shard. Setting pre-swap means the brief
-	//      in-flight window between bucket-pointer flip and overlay
-	//      visibility is bounded by the in-memory swap latency
-	//      (microseconds) rather than the cluster-wide cutover spread.
+	//   1. SET: per prop, atomic with each bucket-pointer flip (onPropSwapped
+	//      hook), so the overlay≠bucket window is one in-memory map write.
+	//      See maybeWirePerPropOverlaySet for why setting it once up front
+	//      was a correctness bug.
 	//   2. CLEAR (defensive, all-failed path): if every per-task swap on
 	//      this shard fails before flipping its bucket pointer (e.g.
 	//      ctx.Canceled during graceful shutdown), the post-loop branch
@@ -928,4 +936,14 @@ func (s *Shard) registerDeleteFromPropertyValueIndex(callback onDeleteFromProper
 	s.propertyValueIndexCallbacksMu.Unlock()
 
 	return func() { disabled.Store(true) }
+}
+
+// AnyActiveMovement reports whether a replica movement is in flight for this shard.
+// replicationFSM is nil during the startup window before SetReplicationFSM runs, so a
+// nil there reads as "no movement" rather than panicking the scheduler goroutine.
+func (s *Shard) AnyActiveMovement() bool {
+	if s == nil || s.index == nil || s.index.db == nil || s.index.db.replicationFSM == nil {
+		return false
+	}
+	return s.index.db.replicationFSM.HasActiveReplicationForShard(s.index.Config.ClassName.String(), s.name)
 }

@@ -172,11 +172,11 @@ func (c *coordinator) Backup(ctx context.Context, cstore coordStore, req *Reques
 	}
 	// make sure there is no active backup
 	if prevID := c.lastOp.renew(req.ID, cstore.HomeDir(req.Bucket, req.Path), req.Bucket, req.Path); prevID != "" {
-		return fmt.Errorf("backup %s already in progress", prevID)
+		return backup.NewErrUnprocessable(fmt.Errorf("backup %s already in progress", prevID))
 	}
 	compressionType, err := CompressionTypeFromLevel(req.Level)
 	if err != nil {
-		return err
+		return backup.NewErrUnprocessable(err)
 	}
 
 	c.descriptor = &backup.DistributedBackupDescriptor{
@@ -257,7 +257,7 @@ func (c *coordinator) Restore(
 
 	// make sure there is no active backup
 	if prevID := c.lastOp.renew(desc.ID, store.HomeDir(req.Bucket, req.Path), req.Bucket, req.Path); prevID != "" {
-		return fmt.Errorf("restoration %s already in progress", prevID)
+		return backup.NewErrUnprocessable(fmt.Errorf("restoration %s already in progress", prevID))
 	}
 
 	for key := range c.Participants {
@@ -456,18 +456,41 @@ func (c *coordinator) OnStatus(ctx context.Context, store coordStore, req *Statu
 	meta, err := store.Meta(ctx, filename, store.bucket, store.path)
 	if err != nil {
 		path := st.Path
-		return nil, fmt.Errorf("coordinator cannot get status: %w: %q: %w store: %v", errMetaNotFound, path, err, st)
+		if errors.As(err, &backup.ErrNotFound{}) {
+			return nil, fmt.Errorf("coordinator cannot get status: %w: %q: %w store: %v", errMetaNotFound, path, err, st)
+		}
+		return nil, fmt.Errorf("coordinator cannot get status: %q: %w store: %v", path, err, st)
 	}
 
 	status := &Status{
-		Path:        store.HomeDir(store.bucket, store.path),
-		StartedAt:   meta.StartedAt,
-		CompletedAt: meta.CompletedAt,
-		Status:      meta.Status,
-		Err:         meta.Error,
-		Size:        float64(meta.PreCompressionSizeBytes) / (1024 * 1024 * 1024), // Convert bytes to GiB,
+		Path:         store.HomeDir(store.bucket, store.path),
+		StartedAt:    meta.StartedAt,
+		CompletedAt:  meta.CompletedAt,
+		Status:       meta.Status,
+		Err:          meta.Error,
+		Size:         float64(meta.PreCompressionSizeBytes) / (1024 * 1024 * 1024), // Convert bytes to GiB,
+		BaseBackupID: meta.BaseBackupID,
 	}
 	return status, nil
+}
+
+// canCommitErrFromResponse promotes a refused [CanCommitResponse] into a
+// typed error. When the response has [CanCommitErrInFlightReindex] kind, we
+// wrap the shared [backup.ErrBackupBlockedByInFlightReindex] sentinel so
+// upstream `errors.Is` checks succeed across the RPC boundary. Empty or
+// [CanCommitErrCannotCommit] kinds (including responses from older nodes
+// that don't set the field) keep the legacy [errCannotCommit] wrapping so
+// existing callers and tests continue to match.
+func canCommitErrFromResponse(resp *CanCommitResponse) error {
+	if resp == nil {
+		return errCannotCommit
+	}
+	switch resp.ErrKind {
+	case CanCommitErrInFlightReindex:
+		return fmt.Errorf("%w: %s", backup.ErrBackupBlockedByInFlightReindex, resp.Err)
+	default:
+		return fmt.Errorf("%w : %v", errCannotCommit, resp.Err)
+	}
 }
 
 // canCommit asks candidates if they agree to participate in DBRO
@@ -529,7 +552,7 @@ func (c *coordinator) canCommit(ctx context.Context, req *Request) (map[string]s
 		g.Go(func() error {
 			resp, err := c.client.CanCommit(ctx, req.NodeHost, req)
 			if err == nil && resp.Timeout == 0 {
-				err = fmt.Errorf("%w : %v", errCannotCommit, resp.Err)
+				err = canCommitErrFromResponse(resp)
 			}
 			if err != nil {
 				return fmt.Errorf("node %q: %w", req.NodeName, err)
@@ -750,7 +773,11 @@ func (c *coordinator) commitAll(ctx context.Context, req *StatusRequest, nodes m
 		node string
 		err  error
 	}
-	errChan := make(chan pair)
+	// Buffer one slot per node so a failing worker never blocks on the send.
+	// The consumer only runs after the submit loop finishes, so an unbuffered
+	// channel would let the first _MaxNumberConns failures hold every g.Go slot
+	// while blocked on the send, deadlocking the submit loop.
+	errChan := make(chan pair, len(nodes))
 	aCounter := int64(len(nodes))
 	g, ctx := enterrors.NewErrorGroupWithContextWrapper(c.log, ctx)
 	g.SetLimit(_MaxNumberConns)

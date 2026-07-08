@@ -618,7 +618,7 @@ func TestBucketCompactionFileName(t *testing.T) {
 				cyclemanager.NewCallbackGroupNoop(), cyclemanager.NewCallbackGroupNoop(), WithWriteSegmentInfoIntoFileName(tt.compaction), WithStrategy(StrategyReplace),
 			)
 			require.NoError(t, err)
-			compact, err := b.disk.compactOnce()
+			compact, err := b.disk.compactOnce(context.Background())
 			require.NoError(t, err)
 			require.True(t, compact)
 			dbFiles, _ = countDbAndWalFiles(t, dirName)
@@ -716,6 +716,123 @@ func TestNetCountComputationAtInit(t *testing.T) {
 	count, err = b.Count(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 0, count)
+}
+
+func TestCountApproximate(t *testing.T) {
+	logger, _ := test.NewNullLogger()
+	ctx := context.Background()
+
+	newBucket := func(t *testing.T) *Bucket {
+		b, err := NewBucketCreator().NewBucket(ctx, t.TempDir(), "", logger, nil,
+			cyclemanager.NewCallbackGroupNoop(), cyclemanager.NewCallbackGroupNoop(),
+			WithCalcCountNetAdditions(true), WithStrategy(StrategyReplace), WithMinWalThreshold(0),
+		)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, b.Shutdown(ctx))
+		})
+		return b
+	}
+
+	requireApprox := func(t *testing.T, b *Bucket, want int) {
+		t.Helper()
+		count, err := b.CountApproximate()
+		require.NoError(t, err)
+		require.Equal(t, want, count)
+	}
+
+	requireExact := func(t *testing.T, b *Bucket, want int) {
+		t.Helper()
+		count, err := b.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, want, count)
+	}
+
+	putKeys := func(t *testing.T, b *Bucket, n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			require.NoError(t, b.Put([]byte(fmt.Sprintf("key-%02d", i)), []byte("value")))
+		}
+	}
+
+	t.Run("memtable-resident inserts and deletes", func(t *testing.T) {
+		b := newBucket(t)
+		putKeys(t, b, 3)
+		require.NoError(t, b.Delete([]byte("key-00")))
+		requireApprox(t, b, 2)
+		requireExact(t, b, 2)
+	})
+
+	t.Run("over-counts an unflushed update of a flushed key until the next flush", func(t *testing.T) {
+		b := newBucket(t)
+		require.NoError(t, b.Put([]byte("key-a"), []byte("value")))
+		require.NoError(t, b.FlushMemtable())
+
+		require.NoError(t, b.Put([]byte("key-a"), []byte("value-2")))
+		requireApprox(t, b, 2)
+		requireExact(t, b, 1)
+
+		require.NoError(t, b.FlushMemtable())
+		requireApprox(t, b, 1)
+	})
+
+	t.Run("never negative", func(t *testing.T) {
+		b := newBucket(t)
+		require.NoError(t, b.Delete([]byte("never-existed")))
+		requireApprox(t, b, 0)
+	})
+
+	t.Run("includes the flushing memtable while a flush is in flight", func(t *testing.T) {
+		b := newBucket(t)
+		putKeys(t, b, 5)
+
+		switched, err := b.atomicallySwitchMemtable(b.createNewActiveMemtable)
+		require.NoError(t, err)
+		require.True(t, switched)
+
+		require.NoError(t, b.Put([]byte("key-new"), []byte("value")))
+		require.NoError(t, b.Put([]byte("key-new-2"), []byte("value")))
+		require.NoError(t, b.Delete([]byte("key-00")))
+		requireApprox(t, b, 6)
+		requireExact(t, b, 6)
+
+		// complete the flush the way FlushAndSwitch does
+		b.waitForZeroWriters(b.flushing)
+		segmentPath, err := b.flushing.flush()
+		require.NoError(t, err)
+		segment, err := b.disk.initAndPrecomputeNewSegment(segmentPath)
+		require.NoError(t, err)
+		require.NoError(t, b.atomicallyAddDiskSegmentAndRemoveFlushing(segment))
+		requireApprox(t, b, 6)
+	})
+
+	t.Run("counter is rebuilt from the WAL on reopen", func(t *testing.T) {
+		dirName := t.TempDir()
+		newFromDir := func() *Bucket {
+			b, err := NewBucketCreator().NewBucket(ctx, dirName, "", logger, nil,
+				cyclemanager.NewCallbackGroupNoop(), cyclemanager.NewCallbackGroupNoop(),
+				WithCalcCountNetAdditions(true), WithStrategy(StrategyReplace),
+			)
+			require.NoError(t, err)
+			return b
+		}
+
+		b := newFromDir()
+		putKeys(t, b, 3)
+		require.NoError(t, b.Delete([]byte("key-00")))
+		requireApprox(t, b, 2)
+		require.NoError(t, b.Shutdown(ctx))
+		require.Equal(t, 0, getFileTypeCount(t, dirName)[".db"], "data must survive as WAL, not a segment")
+
+		b = newFromDir()
+		defer func() { require.NoError(t, b.Shutdown(ctx)) }()
+		// WAL replay dedups key-00's put+delete into a bare tombstone: the
+		// documented delete-of-unseen-key under-count, corrected at flush
+		requireApprox(t, b, 1)
+		requireExact(t, b, 2)
+		require.NoError(t, b.FlushMemtable())
+		requireApprox(t, b, 2)
+	})
 }
 
 func getFileTypeCount(t *testing.T, path string) map[string]int {
@@ -2463,7 +2580,7 @@ func validateMapPairListVsBlockMaxSearchFromSegments(ctx context.Context, segmen
 		duplicateTextBoosts[0] = 1
 		diskTerms := make([][]*SegmentBlockMax, 0, len(segments))
 		for _, segment := range segments {
-			bmws := segment.newSegmentBlockMax(mapKey, 0, 1, 1, nil, nil, nil, 3, bm25config)
+			bmws := segment.newSegmentBlockMax(nil, mapKey, 0, 1, 1, nil, nil, nil, 3, bm25config)
 			diskTerms = append(diskTerms, []*SegmentBlockMax{bmws})
 		}
 
@@ -2550,6 +2667,10 @@ func bucket_Exists_MemtableOnly(ctx context.Context, t *testing.T, opts []Bucket
 
 		err := b.existsWithConsistentView(key, view)
 		assert.ErrorIs(t, err, lsmkv.NotFound)
+
+		exists, err := b.Exists(key)
+		require.NoError(t, err)
+		require.False(t, exists)
 	})
 
 	t.Run("key exists after put", func(t *testing.T) {
@@ -2561,6 +2682,10 @@ func bucket_Exists_MemtableOnly(ctx context.Context, t *testing.T, opts []Bucket
 
 		err = b.existsWithConsistentView(key, view)
 		require.NoError(t, err)
+
+		exists, err := b.Exists(key)
+		require.NoError(t, err)
+		require.True(t, exists)
 	})
 
 	t.Run("exists returns same result as get", func(t *testing.T) {
@@ -2606,6 +2731,10 @@ func bucket_Exists_WithSegments(ctx context.Context, t *testing.T, opts []Bucket
 
 		err := b.existsWithConsistentView(key, view)
 		require.NoError(t, err)
+
+		exists, err := b.Exists(key)
+		require.NoError(t, err)
+		require.True(t, exists)
 	})
 
 	t.Run("nonexistent key returns NotFound", func(t *testing.T) {
@@ -2614,6 +2743,10 @@ func bucket_Exists_WithSegments(ctx context.Context, t *testing.T, opts []Bucket
 
 		err := b.existsWithConsistentView([]byte("nonexistent"), view)
 		assert.ErrorIs(t, err, lsmkv.NotFound)
+
+		exists, err := b.Exists([]byte("nonexistent"))
+		require.NoError(t, err)
+		require.False(t, exists)
 	})
 
 	t.Run("exists returns same result as get for segment data", func(t *testing.T) {
@@ -2668,6 +2801,10 @@ func bucket_Exists_TombstoneInMemtable(ctx context.Context, t *testing.T, opts [
 
 		err := b.existsWithConsistentView(key, view)
 		assert.True(t, errors.Is(err, lsmkv.Deleted))
+
+		exists, err := b.Exists(key)
+		require.NoError(t, err)
+		require.False(t, exists)
 	})
 
 	t.Run("exists and get return consistent Deleted error", func(t *testing.T) {

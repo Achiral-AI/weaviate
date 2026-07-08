@@ -13,10 +13,10 @@ package lsmkv
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 
 	"github.com/weaviate/weaviate/usecases/memwatch"
@@ -56,8 +56,10 @@ type compactorInverted struct {
 	tombstonesToWrite *sroar.Bitmap
 	tombstonesToClean *sroar.Bitmap
 
-	propertyLengthsToWrite map[uint64]uint32
-	propertyLengthsToClean map[uint64]uint32
+	// merged property lengths of c1+c2 as docID-sorted parallel arrays, read by
+	// block re-encoding (via a cursor) and serialized directly — never a map.
+	propLengthIds  []uint64
+	propLengthLens []uint32
 
 	invertedHeader *segmentindex.HeaderInverted
 
@@ -109,7 +111,7 @@ func newCompactorInverted(w io.WriteSeeker,
 	}
 }
 
-func (c *compactorInverted) do() error {
+func (c *compactorInverted) do(ctx context.Context) error {
 	var err error
 
 	if err := c.init(); err != nil {
@@ -131,27 +133,23 @@ func (c *compactorInverted) do() error {
 		return errors.Wrap(err, "get tombstones")
 	}
 
-	propertyLengthsToWrite, err := c.c1.segment.getPropertyLengths()
+	ids1, lens1, err := c.c1.segment.getPropertyLengthsPairs()
 	if err != nil {
 		return errors.Wrap(err, "get property lengths")
 	}
 
-	propertyLengthsToClean, err := c.c2.segment.getPropertyLengths()
+	ids2, lens2, err := c.c2.segment.getPropertyLengthsPairs()
 	if err != nil {
 		return errors.Wrap(err, "get property lengths")
 	}
 
-	c.propertyLengthsToWrite = make(map[uint64]uint32, len(propertyLengthsToWrite))
-	c.propertyLengthsToClean = make(map[uint64]uint32, len(propertyLengthsToClean))
+	c.propLengthIds, c.propLengthLens = mergePropLenPairs(ids1, lens1, ids2, lens2)
 
-	maps.Copy(c.propertyLengthsToWrite, propertyLengthsToWrite)
-	maps.Copy(c.propertyLengthsToClean, propertyLengthsToClean)
-
-	tombstones := c.computeTombstonesAndPropLengths()
+	tombstones := c.computeTombstones()
 
 	keysOffset := segmentindex.HeaderSize + segmentindex.SegmentInvertedDefaultHeaderSize + len(c.c1.segment.invertedHeader.DataFields)
 
-	kis, err := c.writeKeys()
+	kis, err := c.writeKeys(ctx)
 	if err != nil {
 		return errors.Wrap(err, "write keys")
 	}
@@ -163,7 +161,7 @@ func (c *compactorInverted) do() error {
 	}
 
 	propertyLengthsOffset := c.offset
-	_, err = c.writePropertyLengths(c.propertyLengthsToWrite)
+	_, err = c.writePropertyLengths()
 	if err != nil {
 		return errors.Wrap(err, "write property lengths")
 	}
@@ -270,8 +268,8 @@ func (c *compactorInverted) combinePropertyLengths() (uint64, float64) {
 	return count, average
 }
 
-func (c *compactorInverted) writePropertyLengths(propLengths map[uint64]uint32) (int, error) {
-	encoded, err := gobenc.Encode(propLengths)
+func (c *compactorInverted) writePropertyLengths() (int, error) {
+	encoded, err := gobenc.EncodePairs(c.propLengthIds, c.propLengthLens)
 	if err != nil {
 		return 0, err
 	}
@@ -302,7 +300,7 @@ func (c *compactorInverted) writePropertyLengths(propLengths map[uint64]uint32) 
 	return len(encoded) + 8 + 8 + 8, nil
 }
 
-func (c *compactorInverted) writeKeys() ([]segmentindex.Key, error) {
+func (c *compactorInverted) writeKeys(ctx context.Context) ([]segmentindex.Key, error) {
 	key1, value1, _ := c.c1.first()
 	key2, value2, _ := c.c2.first()
 
@@ -311,7 +309,13 @@ func (c *compactorInverted) writeKeys() ([]segmentindex.Key, error) {
 	var kis []segmentindex.Key
 	sim := newSortedMapMerger()
 
-	for {
+	for i := 0; ; i++ {
+		if i%compactor.AbortCheckEveryN == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("merge keys: %w", err)
+			}
+		}
+
 		if key1 == nil && key2 == nil {
 			break
 		}
@@ -333,7 +337,7 @@ func (c *compactorInverted) writeKeys() ([]segmentindex.Key, error) {
 				continue
 			}
 
-			ki, err := c.writeIndividualNode(c.offset, key2, mergedPairs, c.propertyLengthsToWrite)
+			ki, err := c.writeIndividualNode(c.offset, key2, mergedPairs)
 			if err != nil {
 				return nil, errors.Wrap(err, "write individual node (equal keys)")
 			}
@@ -350,7 +354,7 @@ func (c *compactorInverted) writeKeys() ([]segmentindex.Key, error) {
 		if (key1 != nil && bytes.Compare(key1, key2) == -1) || key2 == nil {
 			// key 1 is smaller
 			if values, skip := c.cleanupValues(value1); !skip {
-				ki, err := c.writeIndividualNode(c.offset, key1, values, c.propertyLengthsToWrite)
+				ki, err := c.writeIndividualNode(c.offset, key1, values)
 				if err != nil {
 					return nil, errors.Wrap(err, "write individual node (key1 smaller)")
 				}
@@ -361,7 +365,7 @@ func (c *compactorInverted) writeKeys() ([]segmentindex.Key, error) {
 			key1, value1, _ = c.c1.next()
 		} else {
 			// key 2 is smaller
-			ki, err := c.writeIndividualNode(c.offset, key2, value2, c.propertyLengthsToWrite)
+			ki, err := c.writeIndividualNode(c.offset, key2, value2)
 			if err != nil {
 				return nil, errors.Wrap(err, "write individual node (key2 smaller)")
 			}
@@ -377,7 +381,7 @@ func (c *compactorInverted) writeKeys() ([]segmentindex.Key, error) {
 }
 
 func (c *compactorInverted) writeIndividualNode(offset int, key []byte,
-	values []MapPair, propertyLengths map[uint64]uint32,
+	values []MapPair,
 ) (segmentindex.Key, error) {
 	// NOTE: There are no guarantees in the cursor logic that any memory is valid
 	// for more than a single iteration. Every time you call next() to advance
@@ -392,11 +396,14 @@ func (c *compactorInverted) writeIndividualNode(offset int, key []byte,
 	keyCopy := make([]byte, len(key))
 	copy(keyCopy, key)
 
+	// fresh cursor per term: its docIDs ascend, so lookups stay amortized O(1)
+	view := propLengthsView{ids: c.propLengthIds, lens: c.propLengthLens}
+
 	return segmentInvertedNode{
 		values:      values,
 		primaryKey:  keyCopy,
 		offset:      offset,
-		propLengths: propertyLengths,
+		propLengths: &view,
 	}.KeyIndexAndWriteTo(c.segmentFile.BodyWriter(), c.docIdEncoder, c.tfEncoder, c.k1, c.b, c.avgPropLen)
 }
 
@@ -433,9 +440,7 @@ func (c *compactorInverted) cleanupValues(values []MapPair) (vals []MapPair, ski
 	return values[:last], false
 }
 
-func (c *compactorInverted) computeTombstonesAndPropLengths() *sroar.Bitmap {
-	maps.Copy(c.propertyLengthsToWrite, c.propertyLengthsToClean)
-
+func (c *compactorInverted) computeTombstones() *sroar.Bitmap {
 	if c.cleanupTombstones { // no tombstones to write
 		return sroar.NewBitmap()
 	}
