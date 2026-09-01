@@ -15,9 +15,13 @@ import (
 	"errors"
 
 	"github.com/go-openapi/strfmt"
+
 	"github.com/weaviate/weaviate/usecases/replica"
 	replicaerrors "github.com/weaviate/weaviate/usecases/replica/errors"
 )
+
+// CompareHashTreeRootsMultiPath is node-level; the leading underscore cannot collide with a class segment.
+const CompareHashTreeRootsMultiPath = "/replicas/indices/_compareHashTreeRootsMulti"
 
 func LocalIndexNotReady(resp replica.SimpleResponse) bool {
 	if err := resp.FirstError(); err != nil {

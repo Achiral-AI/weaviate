@@ -33,14 +33,20 @@ type RoutingPlanBuildOptions struct {
 	Tenant              string
 	ConsistencyLevel    ConsistencyLevel
 	DirectCandidateNode string
+
+	// AllowTenantActivation if set to true, it will activate a COLD tenant under auto tenant activation.
+	// Rule of thumb: only set to true if the plan serves an external request.
+	AllowTenantActivation bool
+	// LocalOnly resolves replicas from local schema; no leader query, no tenant activation.
+	LocalOnly bool
 }
 
 // String returns a human-readable representation of the RoutingPlanBuildOptions.
 // Useful for debugging and logging.
 func (o RoutingPlanBuildOptions) String() string {
 	return fmt.Sprintf(
-		"RoutingPlanBuildOptions{shard: %q, tenant: %q, consistencyLevel: %s, directCandidateNode: %q}",
-		o.Shard, o.Tenant, o.ConsistencyLevel, o.DirectCandidateNode,
+		"RoutingPlanBuildOptions{shard: %q, tenant: %q, consistencyLevel: %s, directCandidateNode: %q, localOnly: %t}",
+		o.Shard, o.Tenant, o.ConsistencyLevel, o.DirectCandidateNode, o.LocalOnly,
 	)
 }
 
@@ -146,6 +152,38 @@ func (p ReadRoutingPlan) Shards() []string {
 // Replicas returns a list of replicas
 func (p ReadRoutingPlan) Replicas() []Replica {
 	return p.ReplicaSet.Replicas
+}
+
+// ShardPlans splits p into one plan per shard, so a caller holding a
+// collection-wide plan need not have the router resolve every shard again.
+// p must hold every read replica of each shard it covers: cl resolves against
+// that count, and a failed read retries against the replicas past that level.
+func (p ReadRoutingPlan) ShardPlans(cl ConsistencyLevel) []ReadRoutingPlan {
+	plans := make([]ReadRoutingPlan, 0, len(p.ReplicaSet.Replicas))
+	indexByShard := make(map[string]int, len(p.ReplicaSet.Replicas))
+
+	for _, replica := range p.ReplicaSet.Replicas {
+		i, ok := indexByShard[replica.ShardName]
+		if !ok {
+			i = len(plans)
+			indexByShard[replica.ShardName] = i
+			plans = append(plans, ReadRoutingPlan{
+				LocalHostname:    p.LocalHostname,
+				Shard:            replica.ShardName,
+				Tenant:           p.Tenant,
+				ConsistencyLevel: cl,
+			})
+		}
+		plans[i].ReplicaSet.Replicas = append(plans[i].ReplicaSet.Replicas, replica)
+	}
+
+	// No ValidateConsistencyLevel call: it guards plans spanning several shards,
+	// and a per-shard plan always holds at least the replica that created it.
+	for i := range plans {
+		plans[i].IntConsistencyLevel = cl.ToInt(len(plans[i].ReplicaSet.Replicas))
+	}
+
+	return plans
 }
 
 // HostNames returns the hostnames of the primary write Replicas

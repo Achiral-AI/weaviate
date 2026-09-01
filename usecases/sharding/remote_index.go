@@ -89,7 +89,6 @@ type RemoteIndexClient interface {
 		keywordRanking *searchparams.KeywordRanking, sort []filters.Sort,
 		cursor *filters.Cursor, groupBy *searchparams.GroupBy,
 		additional additional.Properties, targetCombination *dto.TargetCombination, properties []string,
-		selection *searchparams.Selection,
 	) ([]*storobj.Object, []float32, []helpers.ShardQueryProfile, error)
 
 	Aggregate(ctx context.Context, hostname, indexName, shardName string,
@@ -279,11 +278,10 @@ func (ri *RemoteIndex) SearchAllReplicas(ctx context.Context,
 	localNode string,
 	targetCombination *dto.TargetCombination,
 	properties []string,
-	selection *searchparams.Selection,
 ) ([]ReplicasSearchResult, error) {
 	remoteShardQuery := func(node, host string) (ReplicasSearchResult, error) {
 		objs, scores, queryProfiles, err := ri.client.SearchShard(ctx, host, ri.class, shard,
-			queryVec, targetVector, distance, limit, filters, keywordRanking, sort, cursor, groupBy, adds, targetCombination, properties, selection)
+			queryVec, targetVector, distance, limit, filters, keywordRanking, sort, cursor, groupBy, adds, targetCombination, properties)
 		if err != nil {
 			return ReplicasSearchResult{}, err
 		}
@@ -305,7 +303,6 @@ func (ri *RemoteIndex) SearchShard(ctx context.Context, shard string,
 	adds additional.Properties,
 	targetCombination *dto.TargetCombination,
 	properties []string,
-	selection *searchparams.Selection,
 ) ([]*storobj.Object, []float32, []helpers.ShardQueryProfile, string, error) {
 	type result struct {
 		objects       []*storobj.Object
@@ -314,7 +311,7 @@ func (ri *RemoteIndex) SearchShard(ctx context.Context, shard string,
 	}
 	f := func(node, host string) (interface{}, error) {
 		objs, scores, queryProfiles, err := ri.client.SearchShard(ctx, host, ri.class, shard,
-			queryVec, targetVector, distance, limit, filters, keywordRanking, sort, cursor, groupBy, adds, targetCombination, properties, selection)
+			queryVec, targetVector, distance, limit, filters, keywordRanking, sort, cursor, groupBy, adds, targetCombination, properties)
 		if err != nil {
 			return nil, err
 		}
@@ -395,15 +392,10 @@ func (ri *RemoteIndex) GetShardQueueSize(ctx context.Context, shardName string) 
 	return ri.client.GetShardQueueSize(ctx, host, ri.class, shardName)
 }
 
-func (ri *RemoteIndex) GetShardStatus(ctx context.Context, shardName string) (string, error) {
-	owner, err := ri.stateGetter.ShardOwner(ri.class, shardName)
-	if err != nil {
-		return "", fmt.Errorf("class %s has no physical shard %q: %w", ri.class, shardName, err)
-	}
-
-	host, ok := ri.nodeResolver.NodeHostname(owner)
+func (ri *RemoteIndex) GetShardStatus(ctx context.Context, shardName, nodeName string) (string, error) {
+	host, ok := ri.nodeResolver.NodeHostname(nodeName)
 	if !ok {
-		return "", fmt.Errorf("resolve node name %q to host", owner)
+		return "", fmt.Errorf("resolve node name %q to host", nodeName)
 	}
 
 	return ri.client.GetShardStatus(ctx, host, ri.class, shardName)

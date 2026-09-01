@@ -93,10 +93,6 @@ func (s *SearchableRetokenizeStrategy) WriteToReindexBucket(shard ShardLike, buc
 	return nil
 }
 
-func (s *SearchableRetokenizeStrategy) ShouldProcessProperty(property *inverted.Property) bool {
-	return property.HasSearchableIndex && property.Name == s.propName
-}
-
 // MakeAddCallback returns a callback for adding documents to the searchable index.
 // forTargetStrategy controls which tokenization is used: true uses the new target
 // tokenization (for the reindex bucket), false uses the existing tokenization
@@ -117,12 +113,11 @@ func (s *SearchableRetokenizeStrategy) MakeAddCallback(bucketNamer func(string) 
 		if !property.HasSearchableIndex {
 			return nil
 		}
-		if _, ok := propsByName[property.Name]; !ok {
+		bucket, bucketName, skip := resolveScopedDoubleWriteBucket(shard, property,
+			propsByName, bucketNamer, s.SourceBucketName, forTargetStrategy)
+		if skip {
 			return nil
 		}
-
-		bucketName := bucketNamer(property.Name)
-		bucket := shard.store.Bucket(bucketName)
 
 		var items []inverted.Countable
 		if forTargetStrategy && len(property.RawValues) > 0 {
@@ -159,12 +154,11 @@ func (s *SearchableRetokenizeStrategy) MakeDeleteCallback(bucketNamer func(strin
 		if !property.HasSearchableIndex {
 			return nil
 		}
-		if _, ok := propsByName[property.Name]; !ok {
+		bucket, bucketName, skip := resolveScopedDoubleWriteBucket(shard, property,
+			propsByName, bucketNamer, s.SourceBucketName, forTargetStrategy)
+		if skip {
 			return nil
 		}
-
-		bucketName := bucketNamer(property.Name)
-		bucket := shard.store.Bucket(bucketName)
 
 		var items []inverted.Countable
 		if forTargetStrategy && len(property.RawValues) > 0 {

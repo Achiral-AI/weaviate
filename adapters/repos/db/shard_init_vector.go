@@ -29,6 +29,7 @@ import (
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw"
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw/distancer"
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/noop"
+	entlsmkv "github.com/weaviate/weaviate/entities/lsmkv"
 	schemaConfig "github.com/weaviate/weaviate/entities/schema/config"
 	"github.com/weaviate/weaviate/entities/vectorindex"
 	"github.com/weaviate/weaviate/entities/vectorindex/common"
@@ -39,13 +40,19 @@ import (
 )
 
 func (s *Shard) initShardVectors(ctx context.Context) error {
-	if s.index.vectorIndexUserConfig != nil {
-		if err := s.initLegacyVector(ctx, s.lazySegmentLoadingEnabled); err != nil {
+	// Snapshot under the index config lock: updateVectorIndexConfig(s) mutate
+	// these concurrently, and ranging the live map is a fatal
+	// "concurrent map read and map write", not a recoverable race.
+	legacy := s.index.GetVectorIndexConfig("")
+	targets := s.index.getTargetVectorIndexConfigs()
+
+	if legacy != nil {
+		if err := s.initLegacyVector(ctx, legacy, s.lazySegmentLoadingEnabled); err != nil {
 			return err
 		}
 	}
 
-	if err := s.initTargetVectors(ctx, s.lazySegmentLoadingEnabled); err != nil {
+	if err := s.initTargetVectors(ctx, legacy, targets, s.lazySegmentLoadingEnabled); err != nil {
 		return err
 	}
 
@@ -237,7 +244,7 @@ func (s *Shard) initVectorIndex(ctx context.Context,
 		s.index.cycleCallbacks.vectorTombstoneCleanupCycle.Start()
 
 		hfreshConfigID := s.vectorIndexID(targetVector)
-		rootPath := filepath.Join(s.path(), fmt.Sprintf("%s.hfresh.d", hfreshConfigID))
+		rootPath := filepath.Join(s.path(), helpers.HFreshDirName(hfreshConfigID))
 
 		hfreshConfig := &hfresh.Config{
 			Logger:            s.index.logger,
@@ -252,8 +259,10 @@ func (s *Shard) initVectorIndex(ctx context.Context,
 			Store: hfresh.StoreConfig{
 				MakeBucketOptions: makeBucketOptions,
 			},
-			VectorForIDThunk:   hnsw.NewVectorForIDThunk(targetVector, s.vectorByIndexID),
-			TombstoneCallbacks: s.cycleCallbacks.vectorTombstoneCleanupCallbacks,
+			VectorForIDThunk:             hnsw.NewVectorForIDThunk(targetVector, s.vectorByIndexID),
+			MultiVectorForIDThunk:        hnsw.NewVectorForIDThunk(targetVector, s.multiVectorByIndexID),
+			TempVectorForIDWithViewThunk: hnsw.NewTempVectorForIDWithViewThunk(targetVector, s.readVectorByIndexIDIntoSliceWithView),
+			TombstoneCallbacks:           s.cycleCallbacks.vectorTombstoneCleanupCallbacks,
 			Centroids: hfresh.CentroidConfig{
 				HNSWConfig: &hnsw.Config{
 					Logger:                            s.index.logger,
@@ -304,9 +313,11 @@ func (s *Shard) initVectorIndex(ctx context.Context,
 
 func (s *Shard) getOrInitDynamicVectorIndexDB() (*bbolt.DB, error) {
 	if s.dynamicVectorIndexDB == nil {
-		path := filepath.Join(s.path(), dynamic.StateDBFileName)
+		path := filepath.Join(s.path(), dynamicent.StateDBFileName)
 
-		db, err := bbolt.Open(path, 0o600, nil)
+		// Timeout: a leaked handle from a failed shard teardown holds the flock;
+		// without it this open retries forever and wedges the loading goroutine.
+		db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: entlsmkv.BoltFlockTimeout})
 		if err != nil {
 			return nil, errors.Wrapf(err, "open %q", path)
 		}
@@ -317,21 +328,26 @@ func (s *Shard) getOrInitDynamicVectorIndexDB() (*bbolt.DB, error) {
 	return s.dynamicVectorIndexDB, nil
 }
 
-func (s *Shard) initTargetVectors(ctx context.Context, lazyLoadSegments bool) error {
+// initTargetVectors builds the named target-vector indexes. legacy and configs
+// are caller-held snapshots; the migrator needs legacy to tell a
+// single-named-vector layout from a legacy-plus-named one.
+func (s *Shard) initTargetVectors(ctx context.Context, legacy schemaConfig.VectorIndexConfig,
+	configs map[string]schemaConfig.VectorIndexConfig, lazyLoadSegments bool,
+) error {
 	s.vectorIndexMu.Lock()
 	defer s.vectorIndexMu.Unlock()
 
-	if err := newCompressedVectorsMigrator(s.index.logger).do(s); err != nil {
+	if err := newCompressedVectorsMigrator(s.index.logger).do(s, legacy, configs); err != nil {
 		s.index.logger.WithFields(logrus.Fields{
 			"action":   "init_target_vectors",
 			"shard_id": s.ID(),
 		}).Errorf("failed to migrate vectors compressed folder: %v", err)
 	}
 
-	s.vectorIndexes = make(map[string]VectorIndex, len(s.index.vectorIndexUserConfigs))
-	s.queues = make(map[string]*VectorIndexQueue, len(s.index.vectorIndexUserConfigs))
+	s.vectorIndexes = make(map[string]VectorIndex, len(configs))
+	s.queues = make(map[string]*VectorIndexQueue, len(configs))
 
-	for targetVector, vectorIndexConfig := range s.index.vectorIndexUserConfigs {
+	for targetVector, vectorIndexConfig := range configs {
 		if err := s.initTargetVectorWithLock(ctx, targetVector, vectorIndexConfig, lazyLoadSegments); err != nil {
 			return err
 		}
@@ -359,6 +375,10 @@ func (s *Shard) initTargetVectorWithLock(ctx context.Context, targetVector strin
 	}
 	queue, err := NewVectorIndexQueue(s, targetVector, vectorIndex)
 	if err != nil {
+		if shutdownErr := vectorIndex.Shutdown(s.shutCtx); shutdownErr != nil {
+			return fmt.Errorf("cannot create index queue for %q: %w (shutting down the orphaned vector index also failed: %w)",
+				targetVector, err, shutdownErr)
+		}
 		return fmt.Errorf("cannot create index queue for %q: %w", targetVector, err)
 	}
 
@@ -367,17 +387,20 @@ func (s *Shard) initTargetVectorWithLock(ctx context.Context, targetVector strin
 	return nil
 }
 
-func (s *Shard) initLegacyVector(ctx context.Context, lazyLoadSegments bool) error {
+func (s *Shard) initLegacyVector(ctx context.Context, cfg schemaConfig.VectorIndexConfig, lazyLoadSegments bool) error {
 	s.vectorIndexMu.Lock()
 	defer s.vectorIndexMu.Unlock()
 
-	vectorIndex, err := s.initVectorIndex(ctx, "", s.index.vectorIndexUserConfig, lazyLoadSegments)
+	vectorIndex, err := s.initVectorIndex(ctx, "", cfg, lazyLoadSegments)
 	if err != nil {
 		return err
 	}
 
 	queue, err := NewVectorIndexQueue(s, "", vectorIndex)
 	if err != nil {
+		if shutdownErr := vectorIndex.Shutdown(s.shutCtx); shutdownErr != nil {
+			return fmt.Errorf("%w (shutting down the orphaned vector index also failed: %w)", err, shutdownErr)
+		}
 		return err
 	}
 	s.vectorIndex = vectorIndex
@@ -396,6 +419,26 @@ func (s *Shard) setVectorIndex(targetVector string, index VectorIndex) {
 	}
 }
 
+// perVectorDropper is implemented by index types whose Drop() would reach
+// beyond the one vector being dropped. Only dynamic needs it today: its state
+// DB is shared across the shard, so Drop's Close()+Remove would take every
+// sibling's state with it.
+type perVectorDropper interface {
+	DropTargetVector(ctx context.Context) error
+}
+
+// dropOneVectorIndex tears down a single named vector's index. Index types that
+// own nothing shard-wide fall through to Drop(keepFiles=false), which is the
+// same thing for them; the interface exists so a type that DOES own shared
+// state has somewhere to say so, rather than the caller having to know which
+// types are special.
+func dropOneVectorIndex(ctx context.Context, index VectorIndex) error {
+	if d, ok := index.(perVectorDropper); ok {
+		return d.DropTargetVector(ctx)
+	}
+	return index.Drop(ctx, false)
+}
+
 // DropVectorIndex shuts down and removes the named vector index and its queue
 // from this shard, deleting associated files from disk. It also removes the
 // LSM buckets that store the raw and compressed vector data.
@@ -411,21 +454,29 @@ func (s *Shard) DropVectorIndex(ctx context.Context, targetVector string) error 
 	}
 
 	if index, ok := s.vectorIndexes[targetVector]; ok && index != nil {
-		if err := index.Drop(ctx, false); err != nil {
+		if err := dropOneVectorIndex(ctx, index); err != nil {
 			return fmt.Errorf("drop vector index %q: %w", targetVector, err)
 		}
 		delete(s.vectorIndexes, targetVector)
 	}
 
-	// Drop LSM buckets that hold the vector data on disk.
-	vectorsBucket := helpers.GetVectorsBucketName(targetVector)
-	if err := s.removeBucket(ctx, vectorsBucket); err != nil {
-		return fmt.Errorf("drop vectors bucket for %q: %w", targetVector, err)
+	// Remove every on-disk artifact this vector owns — the raw and compressed
+	// buckets, the multivector ones (muvera OR mv_mappings), and hfresh's
+	// directory and buckets. The set lives in helpers so the live drop, the
+	// file sweep and the tests cannot drift apart; passing the collection's
+	// other vector names is what stops a sibling being deleted when its own
+	// bucket collides with one of this target's artifact names.
+	artifacts := helpers.VectorIndexArtifactsFor(targetVector,
+		otherTargetVectors(s.class, targetVector))
+	for _, bucket := range artifacts.LSMBuckets {
+		if err := s.removeBucket(ctx, bucket); err != nil {
+			return fmt.Errorf("drop bucket %q for vector %q: %w", bucket, targetVector, err)
+		}
 	}
-
-	compressedBucket := helpers.GetCompressedBucketName(targetVector)
-	if err := s.removeBucket(ctx, compressedBucket); err != nil {
-		return fmt.Errorf("drop compressed vectors bucket for %q: %w", targetVector, err)
+	for _, dir := range artifacts.ShardDirs {
+		if err := s.removeDirIfExists(s.path(), dir); err != nil {
+			return fmt.Errorf("drop directory %q for vector %q: %w", dir, targetVector, err)
+		}
 	}
 
 	// Remove the index checkpoint entry for this vector.

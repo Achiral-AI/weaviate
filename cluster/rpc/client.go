@@ -19,9 +19,13 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hashicorp/raft"
 	grpc_sentry "github.com/johnbellone/grpc-middleware-sentry"
 	"github.com/sirupsen/logrus"
 	cmd "github.com/weaviate/weaviate/cluster/proto/api"
+	clusterSchema "github.com/weaviate/weaviate/cluster/schema"
+	"github.com/weaviate/weaviate/cluster/types"
+	"github.com/weaviate/weaviate/usecases/auth/authentication/apikey"
 	"github.com/weaviate/weaviate/usecases/namespaces"
 	schemaUC "github.com/weaviate/weaviate/usecases/schema"
 	"github.com/weaviate/weaviate/usecases/usagelimits"
@@ -295,6 +299,8 @@ func (cl *Client) getConn(ctx context.Context, leaderRaftAddr string) (*grpc.Cli
 // (LimitExceededRPCCode) becomes a *LimitExceededError — message from the status,
 // structured limit/value from the ErrorInfo detail — so a follower that forwarded
 // the request surfaces the full canonical 429; NotFound chains the sentinel.
+// NotLeaderRPCCode chains ErrLeaderNotFound/ErrNotLeader so a node that
+// forwarded the request can still recognise a leadership change and retry.
 func fromRPCError(err error) error {
 	if err == nil {
 		return nil
@@ -315,6 +321,16 @@ func fromRPCError(err error) error {
 			}
 		}
 		return le
+	case NotLeaderRPCCode:
+		switch {
+		case strings.Contains(msg, types.ErrLeaderNotFound.Error()):
+			return errors.Join(err, types.ErrLeaderNotFound)
+		case strings.Contains(msg, types.ErrNotLeader.Error()),
+			strings.Contains(msg, raft.ErrLeadershipLost.Error()):
+			// raft.ErrNotLeader shares types.ErrNotLeader's message and matches
+			// the first arm; ErrLeadershipLost has its own wording.
+			return errors.Join(err, types.ErrNotLeader)
+		}
 	case codes.NotFound:
 		switch {
 		case strings.Contains(msg, namespaces.ErrNamespaceGone.Error()):
@@ -333,14 +349,40 @@ func fromRPCError(err error) error {
 			return errors.Join(err, namespaces.ErrInvalidStateTransition)
 		case strings.Contains(msg, namespaces.ErrInvalidState.Error()):
 			return errors.Join(err, namespaces.ErrInvalidState)
+		case strings.Contains(msg, namespaces.ErrNamespaceSuspended.Error()):
+			return errors.Join(err, namespaces.ErrNamespaceSuspended)
+		case strings.Contains(msg, namespaces.ErrCollectionSuspended.Error()):
+			return errors.Join(err, namespaces.ErrCollectionSuspended)
+		case strings.Contains(msg, namespaces.ErrNamespaceResuming.Error()):
+			return errors.Join(err, namespaces.ErrNamespaceResuming)
+		case strings.Contains(msg, namespaces.ErrStateChangedConcurrently.Error()):
+			return errors.Join(err, namespaces.ErrStateChangedConcurrently)
+		case strings.Contains(msg, clusterSchema.ErrMTDisabled.Error()):
+			return errors.Join(err, clusterSchema.ErrMTDisabled)
 		}
 	case codes.AlreadyExists:
-		if strings.Contains(msg, namespaces.ErrAlreadyExists.Error()) {
+		switch {
+		case strings.Contains(msg, namespaces.ErrAlreadyExists.Error()):
 			return errors.Join(err, namespaces.ErrAlreadyExists)
+		case strings.Contains(msg, apikey.ErrUserIdentifierExists.Error()):
+			return errors.Join(err, apikey.ErrUserIdentifierExists)
+		case strings.Contains(msg, apikey.ErrUserExists.Error()):
+			return errors.Join(err, apikey.ErrUserExists)
+		}
+	case codes.Aborted:
+		if strings.Contains(msg, clusterSchema.ErrClassVersionConflict.Error()) {
+			return errors.Join(err, clusterSchema.ErrClassVersionConflict)
 		}
 	case codes.InvalidArgument:
 		if strings.Contains(msg, namespaces.ErrBadRequest.Error()) {
-			return errors.Join(err, namespaces.ErrBadRequest)
+			// namespaces.ErrBadRequest and clusterSchema.ErrBadRequest share the
+			// exact "bad request" message, so the wire cannot discriminate —
+			// rebuild both; every downstream errors.Is check classifies its own
+			// sentinel to a 4xx either way. Any NEW bad-request-style sentinel
+			// mapped to InvalidArgument in toRPCError must be added to this
+			// join AND to TestFromRPCError_SentinelRoundTrip, or its errors.Is
+			// classification silently breaks across the hop.
+			return errors.Join(err, namespaces.ErrBadRequest, clusterSchema.ErrBadRequest)
 		}
 	default:
 		// All other codes pass through unchanged.

@@ -19,6 +19,7 @@ import (
 	"github.com/go-openapi/strfmt"
 	"github.com/pkg/errors"
 	"github.com/weaviate/weaviate/entities/additional"
+	enterrors "github.com/weaviate/weaviate/entities/errors"
 	"github.com/weaviate/weaviate/entities/models"
 	"github.com/weaviate/weaviate/entities/modelsext"
 	"github.com/weaviate/weaviate/entities/modulecapabilities"
@@ -106,7 +107,7 @@ func (v *nearParamsVector) vectorFromParams(ctx context.Context,
 	if nearObject != nil {
 		vector, _, err := v.vectorFromNearObjectParams(ctx, className, nearObject, tenant, targetVector)
 		if err != nil {
-			return nil, errors.Errorf("nearObject params: %v", err)
+			return nil, fmt.Errorf("nearObject params: %w", err)
 		}
 
 		return vector, nil
@@ -187,7 +188,7 @@ func (v *nearParamsVector) targetFromModules(className string, paramValue interf
 	if v.modulesProvider != nil {
 		targetVector, err := v.modulesProvider.TargetsFromSearchParam(className, paramValue)
 		if err != nil {
-			return nil, errors.Errorf("vectorize params: %v", err)
+			return nil, fmt.Errorf("vectorize params: %w", enterrors.NewErrQueryVectorization(err))
 		}
 		return targetVector, nil
 	}
@@ -200,7 +201,7 @@ func (v *nearParamsVector) vectorFromModules(ctx context.Context,
 	if v.modulesProvider != nil {
 		isMultiVector, err := v.modulesProvider.IsTargetVectorMultiVector(className, targetVector)
 		if err != nil {
-			return nil, errors.Errorf("is target vector: %s multi vector: %v", targetVector, err)
+			return nil, fmt.Errorf("is target vector: %s multi vector: %w", targetVector, err)
 		}
 
 		if isMultiVector {
@@ -208,7 +209,7 @@ func (v *nearParamsVector) vectorFromModules(ctx context.Context,
 				className, targetVector, tenant, paramName, paramValue, v.findMultiVector,
 			)
 			if err != nil {
-				return nil, errors.Errorf("vectorize params: %v", err)
+				return nil, fmt.Errorf("vectorize params: %w", enterrors.NewErrQueryVectorization(err))
 			}
 			return vector, nil
 		} else {
@@ -216,7 +217,7 @@ func (v *nearParamsVector) vectorFromModules(ctx context.Context,
 				className, targetVector, tenant, paramName, paramValue, v.findVector,
 			)
 			if err != nil {
-				return nil, errors.Errorf("vectorize params: %v", err)
+				return nil, fmt.Errorf("vectorize params: %w", enterrors.NewErrQueryVectorization(err))
 			}
 			return vector, nil
 		}
@@ -254,6 +255,9 @@ func (v *nearParamsVector) findMultiVector(ctx context.Context, className string
 	}
 }
 
+// classFindVector resolves the stored vector a near-object search anchors at.
+// Failures are typed for API status mapping: ErrSourceObjectNotFound (no such
+// object), ErrSourceObjectNoVector (no usable vector for the request).
 func (v *nearParamsVector) classFindVector(ctx context.Context, className string,
 	id strfmt.UUID, tenant, targetVector string,
 ) ([]float32, string, error) {
@@ -262,7 +266,7 @@ func (v *nearParamsVector) classFindVector(ctx context.Context, className string
 		return nil, "", err
 	}
 	if res == nil {
-		return nil, "", errors.New("vector not found")
+		return nil, "", enterrors.NewErrSourceObjectNotFound(fmt.Errorf("nearObject search-object with id %v not found", id))
 	}
 	if targetVector != "" {
 		if targetVector == modelsext.DefaultNamedVectorName && len(res.Vector) > 0 {
@@ -270,7 +274,7 @@ func (v *nearParamsVector) classFindVector(ctx context.Context, className string
 		}
 
 		if res.Vectors[targetVector] == nil {
-			return nil, "", fmt.Errorf("vector not found for target: %v", targetVector)
+			return nil, "", enterrors.NewErrSourceObjectNoVector(fmt.Errorf("vector not found for target: %v", targetVector))
 		}
 		vec, ok := res.Vectors[targetVector].([]float32)
 		if !ok {
@@ -292,14 +296,15 @@ func (v *nearParamsVector) classFindVector(ctx context.Context, className string
 				}
 			}
 		} else if len(res.Vectors) > 1 {
-			return nil, "", errors.New("multiple vectors found, specify target vector")
+			return nil, "", enterrors.NewErrSourceObjectNoVector(errors.New("multiple vectors found, specify target vector"))
 		}
 	}
 
-	return nil, "", fmt.Errorf("nearObject search-object with id %v has no vector", id)
+	return nil, "", enterrors.NewErrSourceObjectNoVector(fmt.Errorf("nearObject search-object with id %v has no vector", id))
 }
 
 // TODO:colbert try to unify
+// Failures carry the same typed errors as classFindVector.
 func (v *nearParamsVector) classFindMultiVector(ctx context.Context, className string,
 	id strfmt.UUID, tenant, targetVector string,
 ) ([][]float32, string, error) {
@@ -308,11 +313,11 @@ func (v *nearParamsVector) classFindMultiVector(ctx context.Context, className s
 		return nil, "", err
 	}
 	if res == nil {
-		return nil, "", errors.New("vector not found")
+		return nil, "", enterrors.NewErrSourceObjectNotFound(fmt.Errorf("nearObject search-object with id %v not found", id))
 	}
 	if targetVector != "" {
 		if len(res.Vectors) == 0 || res.Vectors[targetVector] == nil {
-			return nil, "", fmt.Errorf("vector not found for target: %v", targetVector)
+			return nil, "", enterrors.NewErrSourceObjectNoVector(fmt.Errorf("vector not found for target: %v", targetVector))
 		}
 		multiVector, ok := res.Vectors[targetVector].([][]float32)
 		if !ok {
@@ -330,10 +335,10 @@ func (v *nearParamsVector) classFindMultiVector(ctx context.Context, className s
 				}
 			}
 		} else if len(res.Vectors) > 1 {
-			return nil, "", errors.New("multiple vectors found, specify target vector")
+			return nil, "", enterrors.NewErrSourceObjectNoVector(errors.New("multiple vectors found, specify target vector"))
 		}
 	}
-	return nil, "", fmt.Errorf("nearObject search-object with id %v has no vector", id)
+	return nil, "", enterrors.NewErrSourceObjectNoVector(fmt.Errorf("nearObject search-object with id %v has no vector", id))
 }
 
 func (v *nearParamsVector) crossClassFindVector(ctx context.Context, id strfmt.UUID, targetVector string) ([]float32, string, error) {

@@ -17,7 +17,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
+	"sort"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
@@ -28,7 +29,6 @@ import (
 	"github.com/weaviate/weaviate/entities/models"
 	"github.com/weaviate/weaviate/entities/modelsext"
 	entSchema "github.com/weaviate/weaviate/entities/schema"
-	"github.com/weaviate/weaviate/usecases/sharding"
 	"github.com/weaviate/weaviate/usecases/usagelimits"
 )
 
@@ -73,14 +73,19 @@ type MutationGuard interface {
 	CheckTenantMutation(className string, tenants []string) error
 
 	// CheckVectorConfigRemoval gates removal of dropped ("none") VectorConfig
-	// entries on a completed cleanup task. Returns non-nil to reject.
-	CheckVectorConfigRemoval(className string, removedVectors []string) error
+	// entries: only the completing cleanup task's in-flight (SWAPPING)
+	// finalize vouches, and only when it covers every shard in shards —
+	// the collection's shard set from the FSM state being applied (the
+	// coverage baseline; FINISHED records never vouch). Returns non-nil to
+	// reject.
+	CheckVectorConfigRemoval(className string, removedVectors, shards []string) error
 }
 
 // Narrow slice of *cluster/distributedtask.Manager so schema doesn't
 // depend on the full Manager surface and tests can stub it. nil-safe.
 type distributedTaskCascadeDeleter interface {
 	DeleteTasksForCollection(collection string) []distributedtask.TaskDescriptor
+	PurgeTasksForCollectionTargetVectors(collection string, targets []string) ([]distributedtask.TaskDescriptor, error)
 }
 
 type SchemaManager struct {
@@ -96,6 +101,9 @@ type SchemaManager struct {
 	tenantLimit func() int
 	// tenantLimitErrTemplate resolves the cap-exceeded message (empty = default).
 	tenantLimitErrTemplate func() string
+	// shouldLogSlowApply controls whether slow RAFT apply diagnostics are
+	// emitted.
+	shouldLogSlowApply func() bool
 }
 
 func NewSchemaManager(nodeId string, db Indexer, parser Parser, reg prometheus.Registerer, log *logrus.Logger) *SchemaManager {
@@ -159,10 +167,42 @@ func (s *SchemaManager) SetTenantLimit(limit func() int, errTemplate func() stri
 	s.tenantLimitErrTemplate = errTemplate
 }
 
+// SetShouldLogSlowApply installs the gate for slow RAFT apply diagnostics.
+func (s *SchemaManager) SetShouldLogSlowApply(fn func() bool) {
+	s.shouldLogSlowApply = fn
+}
+
 // TenantLimitEnforced reports whether a tenant cap is in effect; callers skip
 // the AddTenants serialization when it is not.
 func (s *SchemaManager) TenantLimitEnforced() bool {
 	return s.tenantLimit != nil && s.tenantLimit() >= 0
+}
+
+// DeleteClassFromDB is the store half of a DELETE_CLASS.
+func (s *SchemaManager) DeleteClassFromDB(class string, hasFrozen bool) error {
+	if s.replicationFSM == nil {
+		return fmt.Errorf("replication deleter is not set, this should never happen")
+	} else if err := s.replicationFSM.DeleteReplicationsByCollection(class); err != nil {
+		// Logged, not returned: a stuck replication op must not block the
+		// delete.
+		s.log.WithField("class", class).Errorf("could not delete replication operations for deleted class: %v", err)
+	}
+	return s.db.DeleteClass(class, hasFrozen)
+}
+
+// HasFrozenTenants reports whether the class has tenants on cloud storage
+func (s *SchemaManager) HasFrozenTenants(class string) bool {
+	tenants, err := s.schema.getTenants(class, nil)
+	if err != nil {
+		return false
+	}
+	for _, t := range tenants {
+		if t.ActivityStatus == models.TenantActivityStatusFROZEN ||
+			t.ActivityStatus == models.TenantActivityStatusFREEZING {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SchemaManager) NewSchemaReader() SchemaReader {
@@ -212,7 +252,9 @@ func (s *SchemaManager) SchemaSnapshot() ([]byte, error) {
 func (s *SchemaManager) AliasSnapshot() ([]byte, error) {
 	var buf bytes.Buffer
 
-	err := json.NewEncoder(&buf).Encode(s.schema.aliases)
+	// Raft runs Persist concurrently with Apply, so the alias map must be
+	// copied under the schema read lock.
+	err := json.NewEncoder(&buf).Encode(s.schema.cloneAliases())
 	return buf.Bytes(), err
 }
 
@@ -456,11 +498,83 @@ func (s *SchemaManager) UpdateClass(cmd *command.ApplyRequest, nodeID string, sc
 			}
 		}
 
-		// Gate at apply time so the verdict is RAFT-deterministic.
+		// Gate at apply time so the verdict is RAFT-deterministic. The FSM's own
+		// sharding state is the coverage baseline: a shard neither in the vouching
+		// task's units nor its inherited cleaned-shard set has not been cleaned,
+		// and removing the marker would strand its data.
 		if s.mutationGuard != nil {
 			if removed := removedDroppedVectorConfigs(&meta.Class, u); len(removed) > 0 {
-				if err := s.mutationGuard.CheckVectorConfigRemoval(meta.Class.Class, removed); err != nil {
+				shards := make([]string, 0, len(meta.Sharding.Physical))
+				for name := range meta.Sharding.Physical {
+					shards = append(shards, name)
+				}
+				sort.Strings(shards)
+				if err := s.mutationGuard.CheckVectorConfigRemoval(meta.Class.Class, removed, shards); err != nil {
 					return fmt.Errorf("%w: %w", ErrBadRequest, err)
+				}
+			}
+		}
+
+		// A NEWLY introduced drop marker purges the previous drop's task records
+		// for the same (collection, target) in this same apply — atomically and
+		// RAFT-deterministically. A re-created then re-dropped name therefore
+		// starts with a clean record slate: stale records must not exist next to
+		// a marker they don't belong to, or coverage inheritance and removal
+		// vouching could misattribute them to the new drop. An introduction next
+		// to a still-ACTIVE previous task (SWAPPING for a moment after its
+		// finalize) is refused instead — deterministic and, normally, promptly
+		// retryable; but a node that dies before delivering its post-completion
+		// ack holds SWAPPING indefinitely, and then only DeleteClass clears the
+		// refusal (finalize waits for every node, CancelTask accepts only
+		// STARTED, the TTL pruner skips active tasks).
+		//
+		// LAST reject path — nothing between here and the meta assignments may
+		// fail the apply: purging is a mutation, and this closure edits the live
+		// metaClass with no rollback, so a later reject would strand a purge
+		// from an update that never applied. (Moving the purge below the
+		// assignments is no safer: the refusal above must not fire after the
+		// meta was already mutated.)
+		//
+		// ROLLING UPGRADE: the purge and the refusal below are new behavior in
+		// a deterministic apply, so a mixed-version cluster diverges on this
+		// very log entry — a node without this code neither purges nor refuses,
+		// and the two FSMs stay disagreeing after the upgrade completes. The
+		// AddTask apply has the same exposure (CheckConflict's claim re-check
+		// rejects on new binaries, accepts on old). An in-apply version check
+		// cannot fix it: reading node-local version state during apply is
+		// itself non-deterministic, so any fence has to sit proposal-side.
+		// Accepted while the endpoint is experimental
+		// (ENABLE_EXPERIMENTAL_ALTER_SCHEMA_DROP_VECTOR_INDEX_ENDPOINT); revisit
+		// before the feature is promoted to a supported release.
+		if introduced := introducedDroppedVectorConfigs(&meta.Class, u); len(introduced) > 0 {
+			if s.distributedTaskManager == nil {
+				// Mirrors cascadeDeleteDistributedTasks: a marker introduced
+				// with no task manager wired leaves the previous drop's
+				// records un-purged — visible, not silent.
+				s.log.WithField("class", meta.Class.Class).
+					Warnf("drop-vector marker introduced for %v with no distributed task manager wired; previous task records not purged", introduced)
+			} else {
+				removed, err := s.distributedTaskManager.PurgeTasksForCollectionTargetVectors(meta.Class.Class, introduced)
+				if errors.Is(err, distributedtask.ErrTaskStillActiveForTargetVectors) {
+					// Operator signal: normally a ms-scale SWAPPING window, but a
+					// node that died holding its post-completion ack wedges the
+					// task (and this refusal) until DeleteClass — repeated lines
+					// here for the same class are that wedge, not retry noise.
+					s.log.WithField("class", meta.Class.Class).
+						WithField("targets", introduced).
+						Warnf("drop-vector marker introduction refused; previous drop still completing: %v", err)
+					return fmt.Errorf("%w: a previous drop of %v on %q is still completing; retry: %w",
+						ErrBadRequest, introduced, meta.Class.Class, err)
+				} else if err != nil {
+					// Not the retryable refusal — surface as internal, not 4xx.
+					return fmt.Errorf("purge previous drop's task records for %v on %q: %w",
+						introduced, meta.Class.Class, err)
+				}
+				if len(removed) > 0 {
+					s.log.WithField("class", meta.Class.Class).
+						WithField("targets", introduced).
+						WithField("removed_count", len(removed)).
+						Info("purged previous drop's task records on new drop-vector marker")
 				}
 			}
 		}
@@ -499,6 +613,24 @@ func (s *SchemaManager) UpdateClass(cmd *command.ApplyRequest, nodeID string, sc
 	)
 }
 
+// introducedDroppedVectorConfigs returns the names of VectorConfig entries that
+// are dropped ("none") in next but were live or absent in prev — i.e. markers
+// this update introduces.
+func introducedDroppedVectorConfigs(prev, next *models.Class) []string {
+	var introduced []string
+	for name, cfg := range next.VectorConfig {
+		if !modelsext.IsVectorIndexDropped(cfg) {
+			continue
+		}
+		if prevCfg, ok := prev.VectorConfig[name]; ok && modelsext.IsVectorIndexDropped(prevCfg) {
+			continue
+		}
+		introduced = append(introduced, name)
+	}
+	sort.Strings(introduced)
+	return introduced
+}
+
 // removedDroppedVectorConfigs returns the names of dropped ("none") VectorConfig
 // entries in prev that are absent from next. Only "none" entries: removing a live
 // entry is already rejected by the parser.
@@ -523,19 +655,9 @@ func (s *SchemaManager) DeleteClass(cmd *command.ApplyRequest, schemaOnly bool, 
 		}
 	}
 
-	var hasFrozen bool
-	tenants, err := s.schema.getTenants(cmd.Class, nil)
-	if err != nil {
-		hasFrozen = false
-	}
-
-	for _, t := range tenants {
-		if t.ActivityStatus == models.TenantActivityStatusFROZEN ||
-			t.ActivityStatus == models.TenantActivityStatusFREEZING {
-			hasFrozen = true
-			break
-		}
-	}
+	// Sampled here, not inside updateStore: apply() runs updateSchema (which
+	// drops the class from the schema)
+	hasFrozen := s.HasFrozenTenants(cmd.Class)
 
 	return s.apply(
 		applyOp{
@@ -548,21 +670,50 @@ func (s *SchemaManager) DeleteClass(cmd *command.ApplyRequest, schemaOnly bool, 
 				// DELETE_CLASS apply MUST drop tasks the replay just
 				// re-added. weaviate/0-weaviate-issues#231.
 				s.cascadeDeleteDistributedTasks(cmd.Class)
+				// Same reasoning for the replication FSM: its ops must be
+				// flagged on every apply path, schemaOnly replay and
+				// MetadataOnlyVoters included. Otherwise ShouldConsumeOps(),
+				// and with it three schema gates, disagrees between nodes.
+				s.cascadeDeleteReplicationOps(cmd.Class)
 				return nil
 			},
 			updateStore: func() error {
-				if s.replicationFSM == nil {
-					return fmt.Errorf("replication deleter is not set, this should never happen")
-				} else if err := s.replicationFSM.DeleteReplicationsByCollection(cmd.Class); err != nil {
-					// If there is an error deleting the replications then we log it but make sure not to block the deletion of the class from a UX PoV
-					s.log.WithField("error", err).WithField("class", cmd.Class).Error("could not delete replication operations for deleted class")
-				}
 				return s.db.DeleteClass(cmd.Class, hasFrozen)
 			},
 			schemaOnly:           schemaOnly,
 			enableSchemaCallback: enableSchemaCallback,
 		},
 	)
+}
+
+// cascadeDeleteReplicationOps flags every replication op of class for deletion.
+// It logs and continues rather than returning an error: it runs inside
+// updateSchema, whose error aborts the whole apply, and a replication-FSM
+// hiccup must never block a class deletion.
+func (s *SchemaManager) cascadeDeleteReplicationOps(class string) {
+	if s.replicationFSM == nil {
+		s.log.WithField("class", class).
+			Debug("replication FSM not set; skipping cascade-delete on class delete")
+		return
+	}
+	if err := s.replicationFSM.DeleteReplicationsByCollection(class); err != nil {
+		s.log.WithField("class", class).
+			Errorf("could not delete replication operations for deleted class: %v", err)
+	}
+}
+
+// cascadeDeleteReplicationOpsForTenants is cascadeDeleteReplicationOps scoped to
+// the tenants a DELETE_TENANT apply removes.
+func (s *SchemaManager) cascadeDeleteReplicationOpsForTenants(class string, tenants []string) {
+	if s.replicationFSM == nil {
+		s.log.WithField("class", class).
+			Debug("replication FSM not set; skipping cascade-delete on tenant delete")
+		return
+	}
+	if err := s.replicationFSM.DeleteReplicationsByTenants(class, tenants); err != nil {
+		s.log.WithField("class", class).WithField("tenants", tenants).
+			Errorf("could not delete replication operations for deleted tenants: %v", err)
+	}
 }
 
 func (s *SchemaManager) cascadeDeleteDistributedTasks(class string) {
@@ -753,14 +904,19 @@ func (s *SchemaManager) UpdateTenants(cmd *command.ApplyRequest, schemaOnly bool
 		}
 	}
 
+	// apply() runs updateSchema before updateStore, so this is complete when the DB reads it
+	preFreezeStatuses := make(map[string]string)
+
 	return s.apply(
 		applyOp{
 			op: cmd.GetType().String(),
 			// updateSchema func will update the request's tenants and therefore we use it as a filter that is then sent
 			// to the updateStore function. This allows us to effectively use the schema update to narrow down work for
 			// the DB update.
-			updateSchema:          func() error { return s.schema.updateTenants(cmd.Class, cmd.Version, req, s.replicationFSM) },
-			updateStore:           func() error { return s.db.UpdateTenants(cmd.Class, req) },
+			updateSchema: func() error {
+				return s.schema.updateTenants(cmd.Class, cmd.Version, req, s.replicationFSM, preFreezeStatuses)
+			},
+			updateStore:           func() error { return s.db.UpdateTenants(cmd.Class, req, preFreezeStatuses) },
 			schemaOnly:            schemaOnly,
 			allowPartialSchemaErr: true,
 		},
@@ -797,15 +953,16 @@ func (s *SchemaManager) DeleteTenants(cmd *command.ApplyRequest, schemaOnly bool
 
 	return s.apply(
 		applyOp{
-			op:           cmd.GetType().String(),
-			updateSchema: func() error { return s.schema.deleteTenants(cmd.Class, cmd.Version, req) },
-			updateStore: func() error {
-				if s.replicationFSM == nil {
-					return fmt.Errorf("replication deleter is not set, this should never happen")
-				} else if err := s.replicationFSM.DeleteReplicationsByTenants(cmd.Class, req.Tenants); err != nil {
-					// If there is an error deleting the replications then we log it but make sure not to block the deletion of the class from a UX PoV
-					s.log.WithField("error", err).WithField("class", cmd.Class).WithField("tenants", tenants).Error("could not delete replication operations for deleted tenants")
+			op: cmd.GetType().String(),
+			updateSchema: func() error {
+				// In updateSchema so it also runs on schemaOnly applies; see deleteClass.
+				if err := s.schema.deleteTenants(cmd.Class, cmd.Version, req); err != nil {
+					return err
 				}
+				s.cascadeDeleteReplicationOpsForTenants(cmd.Class, req.Tenants)
+				return nil
+			},
+			updateStore: func() error {
 				return s.db.DeleteTenants(cmd.Class, tenants)
 			},
 			schemaOnly: schemaOnly,
@@ -829,71 +986,6 @@ func (s *SchemaManager) UpdateTenantsProcess(cmd *command.ApplyRequest, schemaOn
 	)
 }
 
-func (s *SchemaManager) SyncShard(cmd *command.ApplyRequest, schemaOnly bool) error {
-	req := command.SyncShardRequest{}
-	if err := json.Unmarshal(cmd.SubCommand, &req); err != nil {
-		return fmt.Errorf("%w: %w", ErrBadRequest, err)
-	}
-
-	if req.NodeId != s.schema.nodeID {
-		return nil
-	}
-
-	var physical *sharding.Physical
-	var partitioningEnabled bool
-	err := s.NewSchemaReader().Read(req.Collection, true, func(class *models.Class, state *sharding.State) error {
-		partitioningEnabled = state.PartitioningEnabled
-		p, ok := state.Physical[req.Shard]
-		if !ok {
-			// no physical, leave var as nil
-			return nil
-		}
-		physical = &p
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("read schema for sync shard: %w", err)
-	}
-
-	return s.apply(
-		applyOp{
-			op:           cmd.GetType().String(),
-			updateSchema: func() error { return nil },
-			updateStore: func() error {
-				// shard does not exist in the sharding state
-				if physical == nil {
-					// TODO: can we guarantee that the shard is not in use?
-					// If so we should call s.db.DropShard(cmd.Class, req.Shard) here instead
-					// For now, to be safe and avoid data loss, we just shut it down
-					s.db.ShutdownShard(cmd.Class, req.Shard)
-					return nil
-				}
-				// shard is present but replica doesn't belong to this node
-				if !slices.Contains(physical.BelongsToNodes, req.NodeId) {
-					s.db.ShutdownShard(cmd.Class, req.Shard)
-					return nil
-				}
-				// collection is ST, shard is present, and replica belongs to node
-				if !partitioningEnabled {
-					s.db.LoadShard(cmd.Class, req.Shard)
-					return nil
-				}
-				// collection is MT, shard is present, and replica belongs to node
-				switch physical.ActivityStatus() {
-				case models.TenantActivityStatusACTIVE:
-					s.db.LoadShard(cmd.Class, req.Shard)
-				case models.TenantActivityStatusINACTIVE:
-					s.db.ShutdownShard(cmd.Class, req.Shard)
-				default:
-					// do nothing
-				}
-				return nil
-			},
-			schemaOnly: schemaOnly,
-		},
-	)
-}
-
 func (s *SchemaManager) ReplicationAddReplicaToShard(cmd *command.ApplyRequest, schemaOnly bool) error {
 	req := command.ReplicationAddReplicaToShard{}
 	if err := json.Unmarshal(cmd.SubCommand, &req); err != nil {
@@ -912,7 +1004,7 @@ func (s *SchemaManager) ReplicationAddReplicaToShard(cmd *command.ApplyRequest, 
 			},
 			updateStore: func() error {
 				if req.TargetNode == s.schema.nodeID {
-					if err := s.db.AddReplicaToShard(req.Class, req.Shard, req.TargetNode); err != nil {
+					if err := s.db.AddReplicaToShardForMovement(req.Class, req.Shard, req.TargetNode); err != nil {
 						return err
 					}
 				}
@@ -951,14 +1043,47 @@ func (op applyOp) validate() error {
 	return nil
 }
 
+const slowApplyThreshold = 10 * time.Second
+
+func humanizeDuration(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return d.Round(time.Millisecond).String()
+	case d < time.Minute:
+		return d.Round(10 * time.Millisecond).String()
+	default:
+		return d.Round(time.Second).String()
+	}
+}
+
 // apply does apply commands from RAFT to schema 1st and then db
 func (s *SchemaManager) apply(op applyOp) error {
 	if err := op.validate(); err != nil {
 		return fmt.Errorf("could not validate raft apply op: %w", err)
 	}
 
+	begin := time.Now()
+	var schemaTook, callbackTook, storeTook time.Duration
+	defer func() {
+		total := time.Since(begin)
+		if s.shouldLogSlowApply == nil || !s.shouldLogSlowApply() || total < slowApplyThreshold || s.log == nil {
+			return
+		}
+		s.log.WithFields(logrus.Fields{
+			"action":        "raft_apply_time",
+			"op":            op.op,
+			"took":          humanizeDuration(total),
+			"schema_took":   humanizeDuration(schemaTook),
+			"callback_took": humanizeDuration(callbackTook),
+			"store_took":    humanizeDuration(storeTook),
+		}).Warnf("raft apply held the apply loop for %s; commands queued behind it are delayed",
+			humanizeDuration(total))
+	}()
+
 	// schema applied 1st to make sure any validation happen before applying it to db
+	schemaBegin := time.Now()
 	schemaErr := op.updateSchema()
+	schemaTook = time.Since(schemaBegin)
 	if schemaErr != nil {
 		var partialErr *PartialUpdateError
 		if !op.allowPartialSchemaErr || !errors.As(schemaErr, &partialErr) {
@@ -969,11 +1094,16 @@ func (s *SchemaManager) apply(op applyOp) error {
 	if op.enableSchemaCallback && s.db != nil {
 		// TriggerSchemaUpdateCallbacks is concurrent and at
 		// this point of time schema shall be up to date.
+		callbackBegin := time.Now()
 		s.db.TriggerSchemaUpdateCallbacks()
+		callbackTook = time.Since(callbackBegin)
 	}
 
 	if !op.schemaOnly {
-		if err := op.updateStore(); err != nil {
+		storeBegin := time.Now()
+		err := op.updateStore()
+		storeTook = time.Since(storeBegin)
+		if err != nil {
 			if schemaErr != nil {
 				// Both the schema update (partial) and the DB update failed.
 				// Return both so the caller is informed of what was skipped

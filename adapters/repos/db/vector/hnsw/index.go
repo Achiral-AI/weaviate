@@ -14,7 +14,6 @@ package hnsw
 import (
 	"context"
 	"fmt"
-	"io"
 	"math"
 	"math/rand"
 	"runtime"
@@ -35,6 +34,7 @@ import (
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw/distancer"
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/multivector"
 	"github.com/weaviate/weaviate/entities/cyclemanager"
+	"github.com/weaviate/weaviate/entities/errorcompounder"
 	"github.com/weaviate/weaviate/entities/schema/config"
 	"github.com/weaviate/weaviate/entities/storobj"
 	"github.com/weaviate/weaviate/entities/vectorindex/compression"
@@ -63,6 +63,10 @@ type hnsw struct {
 	// indicates the index is shutting down
 	shutdownCtx       context.Context
 	shutdownCtxCancel context.CancelFunc
+	// prefillWg tracks the background cache prefill so Shutdown can wait for it.
+	// The prefiller reads the shard's objects bucket, and the shard tears that
+	// bucket down as soon as the vector indexes report they are shut.
+	prefillWg sync.WaitGroup
 
 	// make sure the very first insert happens just once, otherwise we
 	// accidentally overwrite previous entrypoints on parallel imports on an
@@ -119,6 +123,7 @@ type hnsw struct {
 	cache               cache.Cache[float32]
 	waitForCachePrefill bool
 	cachePrefilled      atomic.Bool
+	releaseVectorsOnce  sync.Once
 
 	commitLog CommitLogger
 
@@ -192,6 +197,7 @@ type hnsw struct {
 	shardName             string
 	VectorForIDThunk      common.VectorForID[float32]
 	MultiVectorForIDThunk common.VectorForID[[]float32]
+	vectorFromObject      VectorFromObject
 	shardedNodeLocks      *common.ShardedRWLocks
 	store                 *lsmkv.Store
 
@@ -293,10 +299,13 @@ func New(cfg Config, uc ent.UserConfig,
 		return nil, errors.Wrap(err, "invalid config")
 	}
 
-	if cfg.Logger == nil {
-		logger := logrus.New()
-		logger.Out = io.Discard
-		cfg.Logger = logger
+	cfg.Logger = common.LoggerOrDiscard(cfg.Logger)
+
+	if cfg.AllocChecker == nil {
+		// Insert paths call CheckAlloc unconditionally; a caller that does not
+		// wire a checker (tests, tools) gets the no-op monitor instead of a
+		// nil-pointer panic on the first batch.
+		cfg.AllocChecker = memwatch.NewDummyMonitor()
 	}
 
 	normalizeOnRead := cfg.DistanceProvider.Type() == "cosine-dot"
@@ -304,22 +313,22 @@ func New(cfg Config, uc ent.UserConfig,
 	var vectorCache cache.Cache[float32]
 
 	var muveraEncoder *multivector.MuveraEncoder
-	if uc.Multivector.Enabled && !uc.Multivector.MuveraConfig.Enabled {
+	if uc.Multivector.Enabled && !uc.Multivector.MuveraEnabled() {
 		vectorCache = cache.NewShardedMultiFloat32LockCache(cfg.MultiVectorForIDThunk, uc.VectorCacheMaxObjects,
 			cfg.Logger, normalizeOnRead, cache.DefaultDeletionInterval, cfg.AllocChecker)
 	} else {
-		if uc.Multivector.MuveraConfig.Enabled {
+		if uc.Multivector.MuveraEnabled() {
 			muveraEncoder = multivector.NewMuveraEncoder(uc.Multivector.MuveraConfig, store)
 			err := store.CreateOrLoadBucket(
 				context.Background(),
-				cfg.ID+"_muvera_vectors",
+				helpers.MuveraBucketName(cfg.ID),
 				cfg.MakeBucketOptions(lsmkv.StrategyReplace)...,
 			)
 			if err != nil {
 				return nil, errors.Wrapf(err, "Create or load bucket (muvera store)")
 			}
 			muveraVectorForID := func(ctx context.Context, id uint64) ([]float32, error) {
-				return muveraEncoder.GetMuveraVectorForID(id, cfg.ID+"_muvera_vectors")
+				return muveraEncoder.GetMuveraVectorForID(id, helpers.MuveraBucketName(cfg.ID))
 			}
 			vectorCache = cache.NewShardedFloat32LockCache(
 				muveraVectorForID, cfg.MultiVectorForIDThunk, uc.VectorCacheMaxObjects, 1, cfg.Logger,
@@ -387,6 +396,7 @@ func New(cfg Config, uc ent.UserConfig,
 		rqConfig:                          uc.RQ,
 		rescoreConcurrency:                2 * runtime.GOMAXPROCS(0), // our default for IO-bound activties
 		shardedNodeLocks:                  common.NewDefaultShardedRWLocks(),
+		vectorFromObject:                  cfg.VectorFromObject,
 
 		store:                     store,
 		allocChecker:              cfg.AllocChecker,
@@ -407,11 +417,11 @@ func New(cfg Config, uc ent.UserConfig,
 	index.acornSearch.Store(uc.FilterStrategy == ent.FilterStrategyAcorn)
 
 	index.multivector.Store(uc.Multivector.Enabled)
-	index.muvera.Store(uc.Multivector.MuveraConfig.Enabled)
+	index.muvera.Store(uc.Multivector.MuveraEnabled())
 
 	if uc.BQ.Enabled {
 		var err error
-		if uc.Multivector.Enabled && !uc.Multivector.MuveraConfig.Enabled {
+		if uc.Multivector.Enabled && !uc.Multivector.MuveraEnabled() {
 			index.compressor, err = compressionhelpers.NewBQMultiCompressor(
 				index.distancerProvider, uc.VectorCacheMaxObjects, cfg.Logger, store,
 				cfg.MakeBucketOptions, cfg.AllocChecker, index.getTargetVector(), index.vectorForID)
@@ -428,16 +438,18 @@ func New(cfg Config, uc ent.UserConfig,
 		index.cache = nil
 	}
 
-	if uc.RQ.Enabled {
+	if uc.RQ.Enabled && !uc.RQ.Centering {
+		// Centered RQ needs a training pass to fit the mean, so it activates
+		// via the deferred (PQ/SQ-style) upgrade path
 		index.rqActive.Store(true)
 	}
 
 	if uc.Multivector.Enabled {
 		index.multiDistancerProvider = distancer.NewDotProductProvider()
-		if !uc.Multivector.MuveraConfig.Enabled {
+		if !uc.Multivector.MuveraEnabled() {
 			err := index.store.CreateOrLoadBucket(
 				context.Background(),
-				cfg.ID+"_mv_mappings",
+				helpers.MVMappingsBucketName(cfg.ID),
 				cfg.MakeBucketOptions(lsmkv.StrategyReplace)...,
 			)
 			if err != nil {
@@ -669,6 +681,10 @@ func (h *hnsw) distToNode(distancer compressionhelpers.CompressorDistancer, node
 	if h.compressed.Load() {
 		dist, err := distancer.DistanceToNode(node)
 		if err != nil {
+			var e storobj.ErrNotFound
+			if errors.As(err, &e) {
+				h.handleDeletedNode(e.DocID, "distToNode")
+			}
 			return 0, err
 		}
 
@@ -684,7 +700,7 @@ func (h *hnsw) distToNode(distancer compressionhelpers.CompressorDistancer, node
 		var e storobj.ErrNotFound
 		if errors.As(err, &e) {
 			h.handleDeletedNode(e.DocID, "distBetweenNodeAndVec")
-			return 0, nil
+			return 0, err
 		}
 		// not a typed error, we can recover from, return with err
 		return 0, errors.Wrapf(err,
@@ -707,14 +723,37 @@ func (h *hnsw) distToNode(distancer compressionhelpers.CompressorDistancer, node
 func (h *hnsw) isEmpty() bool {
 	h.RLock()
 	defer h.RUnlock()
-	h.shardedNodeLocks.RLock(h.entryPointID)
-	defer h.shardedNodeLocks.RUnlock(h.entryPointID)
 
-	return h.isEmptyUnlocked()
+	empty := func() bool {
+		h.shardedNodeLocks.RLock(h.entryPointID)
+		defer h.shardedNodeLocks.RUnlock(h.entryPointID)
+
+		return h.isEmptyUnlocked()
+	}()
+	if !empty {
+		return false
+	}
+
+	// a nil entrypoint slot is not proof of emptiness: cleanup can remove a
+	// stranded entrypoint while live nodes remain
+	h.shardedNodeLocks.RLockAll()
+	defer h.shardedNodeLocks.RUnlockAll()
+
+	return !h.hasLiveNodesUnlocked()
 }
 
 func (h *hnsw) isEmptyUnlocked() bool {
 	return h.entryPointID >= uint64(len(h.nodes)) || h.nodes[h.entryPointID] == nil
+}
+
+// callers must hold h.RLock and all sharded node locks
+func (h *hnsw) hasLiveNodesUnlocked() bool {
+	for _, node := range h.nodes {
+		if node != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *hnsw) nodeByID(id uint64) *vertex {
@@ -751,25 +790,32 @@ func (h *hnsw) Drop(ctx context.Context, keepFiles bool) error {
 
 func (h *hnsw) Shutdown(ctx context.Context) error {
 	h.shutdownCtxCancel()
+	h.prefillWg.Wait()
 
-	if err := h.commitLog.Shutdown(ctx); err != nil {
-		return errors.Wrap(err, "hnsw shutdown")
-	}
+	ec := errorcompounder.New()
+	ec.AddWrapf(h.commitLog.Shutdown(ctx), "shutdown commit log")
+	ec.AddWrapf(h.tombstoneCleanupCallbackCtrl.Unregister(ctx), "unregister tombstone cleanup cycle")
 
-	if err := h.tombstoneCleanupCallbackCtrl.Unregister(ctx); err != nil {
-		return errors.Wrap(err, "hnsw shutdown")
-	}
+	// release the vectors even if the steps above failed, otherwise a failed
+	// teardown keeps the whole cache in memory
+	ec.Add(h.releaseVectors())
 
-	if h.compressed.Load() {
-		err := h.compressor.Drop()
-		if err != nil {
-			return errors.Wrap(err, "hnsw shutdown")
+	return ec.ToError()
+}
+
+// releaseVectors frees the vectors held in memory. Only the first call does the
+// work: dropping a cache notifies a goroutine that exits on the first
+// notification, so a repeated drop would block forever.
+func (h *hnsw) releaseVectors() error {
+	var err error
+	h.releaseVectorsOnce.Do(func() {
+		if h.compressed.Load() {
+			err = errors.Wrap(h.compressor.Drop(), "drop compressed store")
+		} else {
+			h.cache.Drop()
 		}
-	} else {
-		h.cache.Drop()
-	}
-
-	return nil
+	})
+	return err
 }
 
 func (h *hnsw) Flush() error {
@@ -876,6 +922,9 @@ func (h *hnsw) ShouldUpgrade() (bool, int) {
 		return h.sqConfig.Enabled, h.sqConfig.TrainingLimit
 	}
 	if h.rqConfig.Enabled {
+		if h.rqConfig.Centering {
+			return true, h.rqConfig.TrainingLimit
+		}
 		return h.rqConfig.Enabled, 1
 	}
 	return h.pqConfig.Enabled, h.pqConfig.TrainingLimit
@@ -887,6 +936,9 @@ func (h *hnsw) ShouldCompressFromConfig(config config.VectorIndexConfig) (bool, 
 		return hnswConfig.SQ.Enabled, hnswConfig.SQ.TrainingLimit
 	}
 	if hnswConfig.RQ.Enabled {
+		if hnswConfig.RQ.Centering {
+			return true, hnswConfig.RQ.TrainingLimit
+		}
 		return hnswConfig.RQ.Enabled, 1
 	}
 	return hnswConfig.PQ.Enabled, hnswConfig.PQ.TrainingLimit
@@ -929,6 +981,26 @@ func (h *hnsw) normalizeVec(vec []float32) []float32 {
 		return distancer.Normalize(vec)
 	}
 	return vec
+}
+
+// normalizeVecForInsert normalizes vec for cosine indexes, using a pooled
+// buffer when the vector's lifetime allows it. The normalized vector is only
+// retained beyond the insert by the uncompressed float vector cache; once
+// the index is compressed — a one-way transition — Preload merely encodes
+// the vector, so the buffer can be reused. The returned release func (nil
+// when no pooled buffer was taken) must be called once the insert no longer
+// references the vector.
+func (h *hnsw) normalizeVecForInsert(vec []float32) ([]float32, func()) {
+	if h.distancerProvider.Type() != "cosine-dot" {
+		return vec, nil
+	}
+	if !h.compressed.Load() {
+		return distancer.Normalize(vec), nil
+	}
+	bufPtr := h.pools.normalizeBufs.Get().(*[]float32)
+	normalized := distancer.NormalizeInto(*bufPtr, vec)
+	*bufPtr = normalized
+	return normalized, func() { h.pools.normalizeBufs.Put(bufPtr) }
 }
 
 // normalizeVecInPlace normalizes the vector in-place without allocating.

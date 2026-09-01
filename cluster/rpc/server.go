@@ -32,6 +32,7 @@ import (
 	"github.com/weaviate/weaviate/cluster/schema"
 	"github.com/weaviate/weaviate/cluster/types"
 	enterrors "github.com/weaviate/weaviate/entities/errors"
+	"github.com/weaviate/weaviate/usecases/auth/authentication/apikey"
 	"github.com/weaviate/weaviate/usecases/monitoring"
 	"github.com/weaviate/weaviate/usecases/namespaces"
 	"github.com/weaviate/weaviate/usecases/usagelimits"
@@ -231,7 +232,10 @@ func toRPCError(err error) error {
 			return d.Err()
 		}
 		return st.Err()
-	case errors.Is(err, types.ErrNotLeader), errors.Is(err, types.ErrLeaderNotFound):
+	case types.IsNoLeader(err):
+		// Also covers hashicorp's raw sentinels: raft.ErrLeadershipLost from a
+		// leader-local apply would otherwise reach the follower as
+		// codes.Internal and render 500.
 		ec = NotLeaderRPCCode
 	case errors.Is(err, types.ErrNotOpen):
 		ec = codes.Unavailable
@@ -242,11 +246,24 @@ func toRPCError(err error) error {
 		errors.Is(err, namespaces.ErrNamespaceNotEmpty),
 		errors.Is(err, namespaces.ErrInvalidState),
 		errors.Is(err, namespaces.ErrInvalidStateTransition),
+		errors.Is(err, namespaces.ErrNamespaceSuspended),
+		errors.Is(err, namespaces.ErrCollectionSuspended),
+		errors.Is(err, namespaces.ErrNamespaceResuming),
+		errors.Is(err, namespaces.ErrStateChangedConcurrently),
 		errors.Is(err, schema.ErrMTDisabled):
 		ec = codes.FailedPrecondition
-	case errors.Is(err, namespaces.ErrAlreadyExists):
+	case errors.Is(err, namespaces.ErrAlreadyExists),
+		errors.Is(err, apikey.ErrUserIdentifierExists),
+		errors.Is(err, apikey.ErrUserExists):
 		ec = codes.AlreadyExists
-	case errors.Is(err, namespaces.ErrBadRequest):
+	case errors.Is(err, schema.ErrClassVersionConflict):
+		// Optimistic-lock rejection: the proposer retries from a fresh read.
+		ec = codes.Aborted
+	case errors.Is(err, namespaces.ErrBadRequest),
+		// Schema-FSM client-fault rejections (drop-vector marker refusal,
+		// removal gate, …) must not reach the forwarding node as
+		// codes.Internal → HTTP 500.
+		errors.Is(err, schema.ErrBadRequest):
 		ec = codes.InvalidArgument
 	case strings.Contains(err.Error(), types.ErrNotFound.Error()):
 		ec = codes.NotFound

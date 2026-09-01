@@ -25,6 +25,7 @@ import (
 	"github.com/rs/cors"
 	"github.com/sirupsen/logrus"
 
+	restsearch "github.com/weaviate/weaviate/adapters/handlers/rest/search"
 	"github.com/weaviate/weaviate/adapters/handlers/rest/state"
 	"github.com/weaviate/weaviate/adapters/handlers/rest/swagger_middleware"
 	"github.com/weaviate/weaviate/entities/models"
@@ -57,7 +58,7 @@ func addHandleRoot(next http.Handler) http.Handler {
 			w.Header().Add("Location", "/v1")
 			w.WriteHeader(http.StatusMovedPermanently)
 			w.Write([]byte(`{"links":{"href":"/v1","name":"api v1","documentationHref":` +
-				`"https://weaviate.io/developers/weaviate/current/"}}`))
+				`"https://docs.weaviate.io/weaviate"}}`))
 			return
 		}
 
@@ -262,19 +263,23 @@ func addLiveAndReadyness(state *state.State, next http.Handler) http.Handler {
 
 func addOperationalMode(state *state.State, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// search and aggregate requests are POSTs (an HTTP write method) but
+		// are semantically reads
+		isSearch := restsearch.IsSearchRoute(r.URL.Path) || restsearch.IsAggregateRoute(r.URL.Path)
+		searchReadAllowed := isSearch && state.ServerConfig.Config.ExperimentalRESTSearchEnabled.Get()
 		switch state.ServerConfig.Config.OperationalMode.Get() {
 		case config.READ_ONLY:
-			if config.IsHTTPWrite(r.Method) && !whitelist(r.URL.Path, config.ReadOnlyWhitelist) {
+			if config.IsHTTPWrite(r.Method) && !whitelist(r.URL.Path, config.ReadOnlyWhitelist) && !searchReadAllowed {
 				writeOperationalModeErrorResponse(w, config.ErrReadOnlyModeEnabled)
 				return
 			}
 		case config.SCALE_OUT:
-			if config.IsHTTPWrite(r.Method) && !whitelist(r.URL.Path, config.ScaleOutWhitelist) {
+			if config.IsHTTPWrite(r.Method) && !whitelist(r.URL.Path, config.ScaleOutWhitelist) && !searchReadAllowed {
 				writeOperationalModeErrorResponse(w, config.ErrScaleOutModeEnabled)
 				return
 			}
 		case config.WRITE_ONLY:
-			if config.IsHTTPRead(r.Method) && !whitelist(r.URL.Path, config.WriteOnlyWhitelist) {
+			if (config.IsHTTPRead(r.Method) && !whitelist(r.URL.Path, config.WriteOnlyWhitelist)) || isSearch {
 				writeOperationalModeErrorResponse(w, config.ErrWriteOnlyModeEnabled)
 				return
 			}

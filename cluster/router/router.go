@@ -30,6 +30,7 @@ import (
 	"github.com/weaviate/weaviate/usecases/cluster"
 	"github.com/weaviate/weaviate/usecases/objects"
 	"github.com/weaviate/weaviate/usecases/schema"
+	"github.com/weaviate/weaviate/usecases/sharding"
 )
 
 // Builder provides a builder for creating router instances based on configuration.
@@ -240,18 +241,31 @@ func (r *singleTenantRouter) getReadReplicasLocation(collection string, tenant s
 		return types.ReadReplicaSet{}, err
 	}
 
-	var replicas []types.Replica
+	readReplicas, _, err := r.readReplicasForShards(collection, tenant, targetShards)
+	return readReplicas, err
+}
 
-	for _, shardName := range targetShards {
+// readReplicasForShards gathers the read replicas of every shard in shards into one set,
+// and names the shards that have none: they leave no trace in the set itself.
+func (r *singleTenantRouter) readReplicasForShards(collection, tenant string, shards []string) (types.ReadReplicaSet, []string, error) {
+	var replicas []types.Replica
+	var shardsWithoutReplicas []string
+
+	for _, shardName := range shards {
 		readReplica, err := r.readReplicasForShard(collection, tenant, shardName)
 		if err != nil {
-			return types.ReadReplicaSet{}, err
+			return types.ReadReplicaSet{}, nil, err
+		}
+
+		if len(readReplica) == 0 {
+			shardsWithoutReplicas = append(shardsWithoutReplicas, shardName)
+			continue
 		}
 
 		replicas = append(replicas, readReplica...)
 	}
 
-	return types.ReadReplicaSet{Replicas: replicas}, nil
+	return types.ReadReplicaSet{Replicas: replicas}, shardsWithoutReplicas, nil
 }
 
 // getWriteReplicasLocation returns only write replicas for single-tenant collections.
@@ -277,20 +291,18 @@ func (r *singleTenantRouter) getWriteReplicasLocation(collection string, tenant 
 
 // targetShards returns either all shards or a single one, depending on the value of the shard parameter.
 func (r *singleTenantRouter) targetShards(collection, shardName string) ([]string, error) {
-	shards, err := r.schemaReader.Shards(collection)
-	if err != nil {
-		return nil, err
-	}
 	if shardName == "" {
-		return shards, nil
+		return r.schemaReader.Shards(collection)
 	}
 
+	// Membership check only — avoids Shards' sorted copy of the full shard list on every routing-plan build.
 	found := false
-	for _, shard := range shards {
-		if shard == shardName {
-			found = true
-			break
-		}
+	err := r.schemaReader.Read(collection, true, func(_ *models.Class, state *sharding.State) error {
+		_, found = state.Physical[shardName]
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	if !found {
 		return nil, fmt.Errorf("error while trying to find shard: %s in collection: %s", shardName, collection)
@@ -330,9 +342,21 @@ func (r *singleTenantRouter) BuildReadRoutingPlan(params types.RoutingPlanBuildO
 
 // buildReadRoutingPlan constructs a read routing plan for single-tenant collections.
 func (r *singleTenantRouter) buildReadRoutingPlan(params types.RoutingPlanBuildOptions) (types.ReadRoutingPlan, error) {
-	readReplicas, err := r.getReadReplicasLocation(r.collection, params.Tenant, params.Shard)
+	targetShards, err := r.targetShards(r.collection, params.Shard)
 	if err != nil {
 		return types.ReadRoutingPlan{}, err
+	}
+
+	readReplicas, shardsWithoutReplicas, err := r.readReplicasForShards(r.collection, params.Tenant, targetShards)
+	if err != nil {
+		return types.ReadRoutingPlan{}, err
+	}
+
+	// A shard with no read replica fails the plan rather than dropping out of it:
+	// callers read every shard the plan holds, so a missing one reads short and reports success.
+	if len(shardsWithoutReplicas) > 0 {
+		return types.ReadRoutingPlan{}, fmt.Errorf("collection %q: no read replica found for shards %q",
+			r.collection, shardsWithoutReplicas)
 	}
 
 	if len(readReplicas.Replicas) == 0 {
@@ -437,7 +461,8 @@ func (r *multiTenantRouter) GetReadWriteReplicasLocation(collection string, tena
 		return types.ReadReplicaSet{}, types.WriteReplicaSet{}, err
 	}
 
-	readReplicas, err := r.getReadReplicasLocation(collection, tenant, shard)
+	// Serves an external request, so auto tenant activation applies.
+	readReplicas, err := r.getReadReplicasLocation(collection, tenant, shard, true)
 	if err != nil {
 		return types.ReadReplicaSet{}, types.WriteReplicaSet{}, err
 	}
@@ -469,12 +494,17 @@ func (r *multiTenantRouter) GetReadReplicasLocation(collection string, tenant st
 	if err := r.validateTenantShard(tenant, shard); err != nil {
 		return types.ReadReplicaSet{}, err
 	}
-	return r.getReadReplicasLocation(collection, tenant, shard)
+	// Serves an external request, so auto tenant activation applies.
+	return r.getReadReplicasLocation(collection, tenant, shard, true)
 }
 
 // getReadReplicasLocation returns only read replicas for multi-tenant collections.
-func (r *multiTenantRouter) getReadReplicasLocation(collection string, tenant, shard string) (types.ReadReplicaSet, error) {
-	tenantStatus, err := r.schemaGetter.OptimisticTenantStatus(context.TODO(), collection, tenant)
+//
+// allowTenantActivation lets the status lookup activate a COLD tenant under auto tenant
+// activation. Only callers acting for an external request pass true; internal ones must not
+// revive a tenant just by asking where its shard lives.
+func (r *multiTenantRouter) getReadReplicasLocation(collection string, tenant, shard string, allowTenantActivation bool) (types.ReadReplicaSet, error) {
+	tenantStatus, err := r.schemaGetter.OptimisticTenantStatus(context.TODO(), collection, tenant, allowTenantActivation)
 	if err != nil {
 		return types.ReadReplicaSet{}, objects.NewErrMultiTenancy(err)
 	}
@@ -483,6 +513,21 @@ func (r *multiTenantRouter) getReadReplicasLocation(collection string, tenant, s
 		return types.ReadReplicaSet{}, err
 	}
 
+	return r.readReplicasFromLocalSchema(collection, shard)
+}
+
+// readReplicasForPlan resolves read replicas honoring LocalOnly: local schema only
+// (no leader query, no tenant activation) when set, else the tenant-status path.
+func (r *multiTenantRouter) readReplicasForPlan(params types.RoutingPlanBuildOptions) (types.ReadReplicaSet, error) {
+	if params.LocalOnly {
+		return r.readReplicasFromLocalSchema(r.collection, params.Shard)
+	}
+	return r.getReadReplicasLocation(r.collection, params.Tenant, params.Shard, params.AllowTenantActivation)
+}
+
+// readReplicasFromLocalSchema resolves read replicas from local schema without any
+// tenant-status check; callers must not use it where activation semantics are required.
+func (r *multiTenantRouter) readReplicasFromLocalSchema(collection, shard string) (types.ReadReplicaSet, error) {
 	replicas, err := r.schemaReader.ShardReplicas(collection, shard)
 	if err != nil {
 		return types.ReadReplicaSet{}, err
@@ -495,8 +540,12 @@ func (r *multiTenantRouter) getReadReplicasLocation(collection string, tenant, s
 }
 
 // getWriteReplicasLocation returns only write replicas for multi-tenant collections.
+//
+// Writes only reach the router on the node serving an external request — replicated writes
+// from a peer land on the Incoming* path, which never consults the router — so auto tenant
+// activation always applies.
 func (r *multiTenantRouter) getWriteReplicasLocation(collection string, tenant, shard string) (types.WriteReplicaSet, error) {
-	tenantStatus, err := r.schemaGetter.OptimisticTenantStatus(context.TODO(), collection, tenant)
+	tenantStatus, err := r.schemaGetter.OptimisticTenantStatus(context.TODO(), collection, tenant, true)
 	if err != nil {
 		return types.WriteReplicaSet{}, objects.NewErrMultiTenancy(err)
 	}
@@ -579,7 +628,7 @@ func (r *multiTenantRouter) BuildReadRoutingPlan(params types.RoutingPlanBuildOp
 
 // buildReadRoutingPlan constructs a read routing plan for multi-tenant collections.
 func (r *multiTenantRouter) buildReadRoutingPlan(params types.RoutingPlanBuildOptions) (types.ReadRoutingPlan, error) {
-	readReplicas, err := r.getReadReplicasLocation(r.collection, params.Tenant, params.Shard)
+	readReplicas, err := r.readReplicasForPlan(params)
 	if err != nil {
 		return types.ReadRoutingPlan{}, err
 	}

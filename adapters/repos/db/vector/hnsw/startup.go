@@ -17,6 +17,8 @@ import (
 	"os"
 	"time"
 
+	"github.com/weaviate/weaviate/adapters/repos/db/helpers"
+
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
@@ -25,6 +27,7 @@ import (
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw/visited"
 	"github.com/weaviate/weaviate/entities/cyclemanager"
 	enterrors "github.com/weaviate/weaviate/entities/errors"
+	"github.com/weaviate/weaviate/entities/storobj"
 	ent "github.com/weaviate/weaviate/entities/vectorindex/hnsw"
 )
 
@@ -283,6 +286,7 @@ func (h *hnsw) restoreRotationalQuantization(data *ent.RQData) error {
 				data.Rotation.Swaps,
 				data.Rotation.Signs,
 				nil,
+				data.Mean,
 				h.store,
 				h.allocChecker,
 				h.makeBucketOptions,
@@ -290,6 +294,8 @@ func (h *hnsw) restoreRotationalQuantization(data *ent.RQData) error {
 				h.vectorForID,
 			)
 		})
+	} else if len(data.Mean) > 0 {
+		return errors.New("rq centering is not supported for multivector indexes")
 	} else {
 		h.trackRQOnce.Do(func() {
 			h.compressor, err = compressionhelpers.RestoreRQMultiCompressor(
@@ -330,6 +336,7 @@ func (h *hnsw) restoreBinaryRotationalQuantization(data *ent.BRQData) error {
 				data.Rotation.Swaps,
 				data.Rotation.Signs,
 				data.Rounding,
+				nil,
 				h.store,
 				h.allocChecker,
 				h.makeBucketOptions,
@@ -369,7 +376,7 @@ func (h *hnsw) restoreDocMappings() error {
 	buf := make([]byte, 8)
 
 	// Get the mappings bucket - handle case where it might be nil
-	bucket := h.store.Bucket(h.id + "_mv_mappings")
+	bucket := h.store.Bucket(helpers.MVMappingsBucketName(h.id))
 	if bucket == nil {
 		err := errors.New("multivector mappings bucket not found")
 		h.logger.WithField("action", "restore_doc_mappings").
@@ -449,6 +456,13 @@ func (h *hnsw) multiVectorForNodeID(ctx context.Context, nodeID uint64) ([]float
 	docID, relativeID := h.compressor.GetKeys(nodeID)
 	vecs, err := h.MultiVectorForIDThunk(ctx, docID)
 	if err != nil {
+		var e storobj.ErrNotFound
+		if errors.As(err, &e) {
+			// key not-found errors by the requested node id, not the internal
+			// docID fetch
+			return nil, storobj.NewErrNotFoundf(nodeID,
+				"multi-vector recovery (docID %d): %v", docID, err)
+		}
 		return nil, errors.Wrapf(err, "multi-vector recovery for nodeID %d (docID %d)", nodeID, docID)
 	}
 	if int(relativeID) >= len(vecs) {
@@ -529,7 +543,13 @@ func (h *hnsw) prefillCache(ctx context.Context) {
 		limit = int(h.cache.CopyMaxSize())
 	}
 
+	ctx, cancelPrefill := context.WithCancel(ctx)
+	stopOnIndexShutdown := context.AfterFunc(h.shutdownCtx, cancelPrefill)
+
 	prefillCacheFunc := func() {
+		defer stopOnIndexShutdown()
+		defer cancelPrefill()
+
 		h.logger.WithFields(logrus.Fields{
 			"action":   "prefill_cache",
 			"duration": 60 * time.Minute,
@@ -547,7 +567,7 @@ func (h *hnsw) prefillCache(ctx context.Context) {
 			// cursor instead of looking up every vector by id (disk-seek bound).
 			err = h.prefillCacheParallel(ctx)
 		} else {
-			err = newVectorCachePrefiller(h.cache, h, h.logger).Prefill(context.Background(), limit)
+			err = newVectorCachePrefiller(h.cache, h, h.logger).Prefill(ctx, limit)
 		}
 
 		if err != nil {
@@ -568,6 +588,10 @@ func (h *hnsw) prefillCache(ctx context.Context) {
 			"action":                 "hnsw_prefill_cache_async",
 			"wait_for_cache_prefill": false,
 		}).Info("not waiting for vector cache prefill, running in background")
-		enterrors.GoWrapper(prefillCacheFunc, h.logger)
+		h.prefillWg.Add(1)
+		enterrors.GoWrapper(func() {
+			defer h.prefillWg.Done()
+			prefillCacheFunc()
+		}, h.logger)
 	}
 }

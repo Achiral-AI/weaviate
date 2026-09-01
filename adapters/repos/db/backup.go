@@ -21,17 +21,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/weaviate/weaviate/entities/models"
-	"github.com/weaviate/weaviate/usecases/file"
-	"github.com/weaviate/weaviate/usecases/sharding"
-
-	"github.com/weaviate/weaviate/entities/diskio"
-	enterrors "github.com/weaviate/weaviate/entities/errors"
-
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+
 	"github.com/weaviate/weaviate/entities/backup"
+	"github.com/weaviate/weaviate/entities/diskio"
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+	"github.com/weaviate/weaviate/entities/models"
 	"github.com/weaviate/weaviate/entities/schema"
+	dynamicent "github.com/weaviate/weaviate/entities/vectorindex/dynamic"
+	flatent "github.com/weaviate/weaviate/entities/vectorindex/flat"
+	"github.com/weaviate/weaviate/usecases/file"
+	"github.com/weaviate/weaviate/usecases/sharding"
 )
 
 type BackupState struct {
@@ -46,6 +47,16 @@ const (
 	migrationsDir = ".migrations"
 	tmpExt        = ".tmp"
 )
+
+// Subdirectories listInactiveShardFiles skips when it walks a shard for vector
+// index files. lsm/ was already listed by listInactiveLSMFiles. hashtree_uuid/
+// and changelog/ belong in no backup: Shard.ListBackupFiles omits them too, and
+// a shard rebuilds its hashtree and sweeps orphaned change logs when it loads.
+var nonVectorShardDirs = map[string]struct{}{
+	lsmDir:           {},
+	hashTreeDirName:  {},
+	changelogDirName: {},
+}
 
 // Backupable returns whether all given class can be backed up.
 // Refuses if any shard has an in-flight runtime-reindex; this runs in
@@ -101,7 +112,14 @@ func (db *DB) BackupDescriptors(ctx context.Context, bakid string, classes []str
 ) <-chan backup.ClassDescriptor {
 	ds := make(chan backup.ClassDescriptor, len(classes))
 	f := func() {
+		// The caller drains this channel to close before it releases any index, so
+		// every way out of this goroutine has to leave the channel closed.
+		defer close(ds)
 		for _, c := range classes {
+			if err := ctx.Err(); err != nil {
+				ds <- backup.ClassDescriptor{Name: c, BackupID: bakid, Error: err}
+				return
+			}
 			desc := backup.ClassDescriptor{Name: c, BackupID: bakid}
 			func() {
 				idx := db.GetIndex(schema.ClassName(c))
@@ -111,12 +129,11 @@ func (db *DB) BackupDescriptors(ctx context.Context, bakid string, classes []str
 				}
 				idx.dropIndex.RLock()
 				defer idx.dropIndex.RUnlock()
-				idx.closeLock.RLock()
-				defer idx.closeLock.RUnlock()
-				if idx.closed {
+				if err := idx.enterRead(); err != nil {
 					desc.Error = fmt.Errorf("index for class %v is closed", c)
 					return
 				}
+				defer idx.exitRead()
 				var classBaseDescr []*backup.ClassDescriptor
 				for _, b := range baseDescrs {
 					classbaseDescrTmp := b.GetClassDescriptor(c)
@@ -135,7 +152,6 @@ func (db *DB) BackupDescriptors(ctx context.Context, bakid string, classes []str
 				break
 			}
 		}
-		close(ds)
 	}
 	enterrors.GoWrapper(f, db.logger)
 	return ds
@@ -160,9 +176,13 @@ func (db *DB) ReleaseBackup(ctx context.Context, bakID, class string) (err error
 	}()
 
 	idx := db.GetIndex(schema.ClassName(class))
+	if idx == nil {
+		// a class deleted mid-backup is unpublished before its drop runs, and that
+		// drop parks on backupLock until this call releases it.
+		idx = db.droppingIndex(indexID(schema.ClassName(class)))
+	}
+
 	if idx != nil {
-		idx.closeLock.RLock()
-		defer idx.closeLock.RUnlock()
 		return idx.ReleaseBackup(ctx, bakID)
 	} else {
 		// index has been deleted in the meantime. Cleanup files that were kept to complete backup
@@ -251,6 +271,8 @@ func (i *Index) descriptor(ctx context.Context, backupID string, desc *backup.Cl
 	if useHardlinks {
 		return i.descriptorWithHardlinks(ctx, backupID, desc, classBaseDescrs)
 	}
+	// NO-HARDLINK-BACKUP: only reachable on filesystems without hardlink support.
+	// Removed in v1.40; bugs here are not fixed.
 	return i.descriptorWithoutHardlinks(ctx, backupID, desc, classBaseDescrs)
 }
 
@@ -330,6 +352,12 @@ func (i *Index) descriptorWithHardlinks(ctx context.Context, backupID string, de
 func (i *Index) backupShardWithHardlinks(ctx context.Context, name string, classBaseDescrs []*backup.ClassDescriptor, stagingRoot string) (*backup.ShardDescriptor, error) {
 	shardBaseDescr := i.collectShardBaseDescrs(name, classBaseDescrs)
 
+	// Deferred before backupLock so it runs after the unlock: dropping the last
+	// shard reference can run the shard teardown inline, and doing that under
+	// backupLock blocks every write to the shard for the teardown's duration.
+	releaseShard := func() {}
+	defer func() { releaseShard() }()
+
 	i.backupLock.Lock(name)
 	defer i.backupLock.Unlock(name)
 
@@ -382,7 +410,7 @@ func (i *Index) backupShardWithHardlinks(ctx context.Context, name string, class
 	if err != nil {
 		return nil, fmt.Errorf("prevent shutdown of shard %v: %w", name, err)
 	}
-	defer release()
+	releaseShard = release
 
 	i.shardCreateLocks.Unlock(name)
 	shardCreateLocksHeld = false
@@ -435,14 +463,8 @@ func (i *Index) backupInactiveShardWithHardlinks(name string, sd *backup.ShardDe
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return fmt.Errorf("create staging subdir for inactive shard %s file %s: %w", name, relPath, err)
 		}
-		if backup.IsImmutableFile(relPath) {
-			if err := os.Link(src, dst); err != nil {
-				return fmt.Errorf("hardlink inactive shard %s file %s to staging: %w", name, relPath, err)
-			}
-		} else {
-			if err := file.CopyFile(src, dst); err != nil {
-				return fmt.Errorf("copy inactive shard %s file %s to staging: %w", name, relPath, err)
-			}
+		if err := file.CopyFile(src, dst); err != nil {
+			return fmt.Errorf("copy inactive shard %s file %s to staging: %w", name, relPath, err)
 		}
 	}
 	if err := file.HardlinkFiles(hardlinks); err != nil {
@@ -458,6 +480,8 @@ func (i *Index) backupInactiveShardWithHardlinks(name string, sd *backup.ShardDe
 
 // descriptorWithoutHardlinks is the fallback path for filesystems that don't support
 // hardlinks. Compaction remains paused for the entire backup upload duration.
+//
+// Deprecated: NO-HARDLINK-BACKUP. Removed in v1.40; bugs here are not fixed.
 func (i *Index) descriptorWithoutHardlinks(ctx context.Context, backupID string, desc *backup.ClassDescriptor, classBaseDescrs []*backup.ClassDescriptor) (err error) {
 	defer func() {
 		if err != nil {
@@ -501,6 +525,8 @@ func (i *Index) descriptorWithoutHardlinks(ctx context.Context, backupID string,
 //
 // For inactive shards, backupProtectedShards is set and backupLock.Lock is held
 // until ReleaseBackup to block both activation and FREEZE/FROZEN file operations.
+//
+// Deprecated: NO-HARDLINK-BACKUP. Removed in v1.40; bugs here are not fixed.
 func (i *Index) backupShardWithoutHardlinks(ctx context.Context, name string, classBaseDescrs []*backup.ClassDescriptor) (*backup.ShardDescriptor, error) {
 	shardBaseDescr := i.collectShardBaseDescrs(name, classBaseDescrs)
 
@@ -568,6 +594,8 @@ func (i *Index) backupShardWithoutHardlinks(ctx context.Context, name string, cl
 
 // backupInactiveShardWithoutHardlinks backs up an inactive (unloaded) shard by reading
 // its files directly from disk.
+//
+// Deprecated: NO-HARDLINK-BACKUP. Removed in v1.40; bugs here are not fixed.
 func (i *Index) backupInactiveShardWithoutHardlinks(name string, sd *backup.ShardDescriptor, shardBaseDescr []backup.ShardAndID) error {
 	shardDir := shardPath(i.path(), name)
 	if _, err := os.Stat(shardDir); err != nil {
@@ -648,6 +676,8 @@ func (i *Index) ReleaseBackup(ctx context.Context, id string) error {
 
 	// Release non-hardlink backup protections: clear the protection flag and
 	// release the held backupLock.Lock for each protected shard.
+	//
+	// NO-HARDLINK-BACKUP: removed in v1.40; bugs here are not fixed.
 	i.backupProtectedShards.Range(func(key, _ any) bool {
 		name := key.(string)
 		i.backupLock.Unlock(name)
@@ -656,6 +686,14 @@ func (i *Index) ReleaseBackup(ctx context.Context, id string) error {
 	})
 
 	i.resetBackupState()
+
+	// Releasing backupLock above unblocks a waiting index.drop(), which shuts the
+	// shard stores down. Resuming their cycles now would be a use-after-drop.
+	if err := i.enterRead(); err != nil {
+		return nil
+	}
+	defer i.exitRead()
+
 	// resumeMaintenanceCycles is still called for safety, but is a no-op since
 	// CreateBackupSnapshot already resumed compaction. Handles edge cases where
 	// a snapshot creation failed mid-way.
@@ -689,7 +727,9 @@ func (i *Index) resetBackupState() {
 }
 
 func (i *Index) resumeMaintenanceCycles(ctx context.Context) (lastErr error) {
-	i.ForEachShard(func(name string, shard ShardLike) error {
+	// Only loaded shards have maintenance cycles to resume; a cold shard has
+	// none, so skip it rather than force-load every shard after a backup.
+	i.ForEachLoadedShard(func(name string, shard ShardLike) error {
 		if err := shard.resumeMaintenanceCycles(ctx); err != nil {
 			lastErr = err
 			i.logger.WithField("shard", name).WithField("op", "resume_maintenance").Error(err)
@@ -792,12 +832,6 @@ func (i *Index) listInactiveShardFiles(shardName string, sd *backup.ShardDescrip
 	}
 	files = append(files, lsmFiles...)
 
-	// List vector index files (all non-lsm subdirectories of the shard).
-	// Expected directories: <target>.hnsw.commitlog.d/, <target>.hnsw.snapshot.d/,
-	// <target>.queue.d/, <target>/ (flat/dynamic index), hashtree_<target>/.
-	// An indiscriminate walk is safe here because INACTIVE shards are fully
-	// quiesced — Shutdown has flushed and closed all stores, so there are no
-	// active commit logs or transient files to exclude.
 	// Note: this reads shardDir, not lsmPath — the two ReadDir calls in this
 	// function and listInactiveLSMFiles operate on different directories with
 	// different traversal semantics.
@@ -805,8 +839,39 @@ func (i *Index) listInactiveShardFiles(shardName string, sd *backup.ShardDescrip
 	if err != nil {
 		return nil, fmt.Errorf("read shard dir: %w", err)
 	}
+
+	// The vector indexes keep state as regular files at the shard root, which the
+	// walk below does not reach: the dynamic index's upgrade state and one flat
+	// metadata file per target vector. A restore missing the upgrade state
+	// concludes the index never upgraded and deletes the HNSW graph holding the
+	// only vectors.
 	for _, entry := range entries {
-		if !entry.IsDir() || entry.Name() == lsmDir {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name != dynamicent.StateDBFileName && !flatent.IsMetadataFile(name) {
+			continue
+		}
+		relPath, err := filepath.Rel(rootPath, filepath.Join(shardDir, name))
+		if err != nil {
+			return nil, fmt.Errorf("%s rel path: %w", name, err)
+		}
+		files = append(files, relPath)
+	}
+
+	// List vector index files, walking every shard subdirectory outside
+	// nonVectorShardDirs. Expected: <id>.hnsw.commitlog.d/, <id>.hnsw.snapshot.d/,
+	// <id>.queue.d/ and <id>.hfresh.d/ for a vector index id. Flat and dynamic
+	// state is not a directory; the loop above lists it.
+	// Walking whatever remains is safe here because INACTIVE shards are fully
+	// quiesced — Shutdown has flushed and closed all stores, so there are no
+	// active commit logs or transient files to exclude.
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, skip := nonVectorShardDirs[entry.Name()]; skip {
 			continue
 		}
 		vectorDir := filepath.Join(shardDir, entry.Name())
@@ -856,6 +921,12 @@ func listInactiveLSMFiles(lsmDir, rootPath string) ([]string, error) {
 			// Walk migrations recursively, same as Store.listMigrationFiles.
 			if err := filepath.WalkDir(entryPath, func(fpath string, d os.DirEntry, err error) error {
 				if err != nil || d == nil || d.IsDir() {
+					return nil
+				}
+				// A crash mid-rename leaves the tracker's scratch file behind,
+				// and nothing under .migrations ever sweeps it. Copying it
+				// would carry it into every later backup and restore.
+				if filepath.Ext(d.Name()) == tmpExt {
 					return nil
 				}
 				relPath, relErr := filepath.Rel(rootPath, fpath)

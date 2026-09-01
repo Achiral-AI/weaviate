@@ -136,6 +136,7 @@ func TestHybridOffsets(t *testing.T) {
 	}).Maybe()
 	mockSchemaReader.EXPECT().ReadOnlySchema().Return(models.Schema{Classes: nil}).Maybe()
 	mockSchemaReader.EXPECT().ShardReplicas(mock.Anything, mock.Anything).Return([]string{"node1"}, nil).Maybe()
+	mockSchemaReader.EXPECT().WaitForUpdate(mock.Anything, mock.Anything).Return(nil).Maybe()
 	mockReplicationFSMReader := replicationTypes.NewMockReplicationFSMReader(t)
 	mockReplicationFSMReader.EXPECT().HasActiveReplicationForShard(mock.Anything, mock.Anything).Return(false).Maybe()
 	mockReplicationFSMReader.EXPECT().FilterOneShardReplicasRead(mock.Anything, mock.Anything, mock.Anything).Return([]string{"node1"}).Maybe()
@@ -152,7 +153,7 @@ func TestHybridOffsets(t *testing.T) {
 		QueryHybridMaximumResults: queryHybridMaximumResults[0],
 		MaxImportGoroutinesFactor: 60,
 	}, &FakeRemoteClient{}, mockNodeSelector, &FakeRemoteNodeClient{}, nil, nil, nil,
-		mockNodeSelector, mockSchemaReader, mockReplicationFSMReader)
+		mockNodeSelector, mockSchemaReader, mockReplicationFSMReader, nil)
 	require.Nil(t, err)
 	repo.SetSchemaGetter(schemaGetter)
 	require.Nil(t, repo.WaitForStartup(context.TODO()))
@@ -243,6 +244,10 @@ func TestHybridOffsets(t *testing.T) {
 									gtResults[*res.DocID] = res.Score
 								}
 							} else {
+								// Limit == -1 with an offset can include items beyond the ground-truth set.
+								if pagination.Limit == -1 && pagination.Offset > 0 {
+									return
+								}
 								if pagination.Limit != -1 && pagination.Offset+pagination.Limit > int(queryHybridMaximumResult) {
 									// no need to check the results, as this is the exception where we override the maximum results with an offset of zero
 									// t.Logf("Skipping result check for pagination offset %d + limit %d > %d", pagination.Offset, pagination.Limit, int(queryHybridMaximumResult))

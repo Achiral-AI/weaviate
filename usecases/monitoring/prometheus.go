@@ -73,6 +73,9 @@ type PrometheusMetrics struct {
 	MmapOperations                      *prometheus.CounterVec
 	MmapProcMaps                        prometheus.Gauge
 
+	// Reindex metrics
+	RangeableInMemoryRebuildDegraded *prometheus.CounterVec
+
 	// Backup/Restore metrics
 	BackupRestoreDurations            *prometheus.SummaryVec
 	BackupStoreDurations              *prometheus.SummaryVec
@@ -129,6 +132,13 @@ type PrometheusMetrics struct {
 	ShardsLoading   prometheus.Gauge
 	ShardsUnloading prometheus.Gauge
 
+	// Shards supersedes the four gauges above: summing its states reproduces
+	// each of them, and the registration label splits them into the shards
+	// opened at creation and the ones a lazy collection opened on access.
+	Shards *prometheus.GaugeVec
+
+	LazyShardWarmupDecisions *prometheus.CounterVec
+
 	// ShardHaltForTransferForceResume: non-zero means a transfer was
 	// force-resumed mid-stream — compaction may have raced the transfer.
 	ShardHaltForTransferForceResume *prometheus.CounterVec
@@ -178,6 +188,8 @@ type PrometheusMetrics struct {
 	ModuleExternalError              *prometheus.CounterVec
 	ModuleCallError                  *prometheus.CounterVec
 	ModuleBatchError                 *prometheus.CounterVec
+
+	ModuleExternalRequestResends prometheus.Counter
 
 	// Checksum metrics
 	ChecksumValidationDuration prometheus.Summary
@@ -348,6 +360,7 @@ func (pm *PrometheusMetrics) DeleteShard(className, shardName string) error {
 	pm.StartupProgress.DeletePartialMatch(labels)
 	pm.StartupDurations.DeletePartialMatch(labels)
 	pm.StartupDiskIO.DeletePartialMatch(labels)
+	pm.RangeableInMemoryRebuildDegraded.DeletePartialMatch(labels)
 	return nil
 }
 
@@ -580,6 +593,12 @@ func newPrometheusMetrics() *PrometheusMetrics {
 			Help: "Number of entries in /proc/self/maps",
 		}),
 
+		// Reindex metrics
+		RangeableInMemoryRebuildDegraded: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "rangeable_inmemory_rebuild_degraded_total",
+			Help: "Number of times the rangeable in-memory rebuild at reindex finalize degraded to disk serving instead of activating in-memory acceleration",
+		}, []string{"class_name", "shard_name", "property"}),
+
 		// Queue metrics
 		QueueSize: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "queue_size",
@@ -781,6 +800,15 @@ func newPrometheusMetrics() *PrometheusMetrics {
 			Name: "shards_unloading",
 			Help: "Number of shards in process of unloading",
 		}),
+		Shards: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "weaviate_shards",
+			Help: "Number of shards the node holds, by lifecycle state and by whether the collection opens its shards eagerly at creation or lazily on first access",
+		}, []string{"state", "registration"}),
+
+		LazyShardWarmupDecisions: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "weaviate_lazy_shard_warmup_decisions_total",
+			Help: "Number of shards the startup warmup sweep considered, by what it did with each",
+		}, []string{"outcome"}),
 
 		ShardHaltForTransferForceResume: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "shard_halt_for_transfer_force_resume_total",
@@ -935,6 +963,10 @@ func newPrometheusMetrics() *PrometheusMetrics {
 			Name: "weaviate_module_batch_error_total",
 			Help: "Number of batch errors",
 		}, []string{"operation", "class_name"}),
+		ModuleExternalRequestResends: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "weaviate_module_request_resends_total",
+			Help: "Number of module requests to external APIs sent again after their connection broke",
+		}),
 
 		// Checksum metrics
 		ChecksumValidationDuration: promauto.NewSummary(prometheus.SummaryOpts{
@@ -950,6 +982,8 @@ func newPrometheusMetrics() *PrometheusMetrics {
 	if err := m.initObjectsTtl(); err != nil {
 		panic(err)
 	}
+
+	InitGaugeVec(m.Shards, AllShardLabels())
 
 	return m
 }
@@ -1014,6 +1048,14 @@ func (m *PrometheusMetrics) initObjectsTtl() error {
 	}
 
 	return nil
+}
+
+func (m *PrometheusMetrics) IncRangeableInMemoryRebuildDegraded(className, shardName, propName string) {
+	m.RangeableInMemoryRebuildDegraded.With(prometheus.Labels{
+		"class_name": className,
+		"shard_name": shardName,
+		"property":   propName,
+	}).Inc()
 }
 
 // --- Objects TTL: main ---

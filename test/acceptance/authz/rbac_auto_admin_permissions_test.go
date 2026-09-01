@@ -72,6 +72,7 @@ func TestAuthzAllEndpointsAdminDynamically(t *testing.T) {
 		url = strings.ReplaceAll(url, "{userType}", "db")
 		url = strings.ReplaceAll(url, "{groupType}", "oidc")
 		url = strings.ReplaceAll(url, "{aliasName}", "aliasName")
+		url = strings.ReplaceAll(url, "{collection}", className)
 		url = strings.ReplaceAll(url, "{namespace_id}", "someNamespace")
 
 		t.Run(url+"("+strings.ToUpper(endpoint.method)+")", func(t *testing.T) {
@@ -83,8 +84,32 @@ func TestAuthzAllEndpointsAdminDynamically(t *testing.T) {
 
 			endpoint.method = strings.ToUpper(endpoint.method)
 
+			body := endpoint.validGeneratedBodyData
+			// near-text's generated body is {} (allOf schema) and 422s on the
+			// required query before authz; send a valid query so it reaches authz.
+			if endpoint.path == "/search/{collection}/near-text" && endpoint.method == http.MethodPost {
+				body = []byte(`{"query":["ABC"]}`)
+			}
+			// same for bm25 (its query is a plain string)
+			if endpoint.path == "/search/{collection}/bm25" && endpoint.method == http.MethodPost {
+				body = []byte(`{"query":"ABC"}`)
+			}
+			// same for hybrid
+			if endpoint.path == "/search/{collection}/hybrid" && endpoint.method == http.MethodPost {
+				body = []byte(`{"query":"ABC"}`)
+			}
+			// same for near-object (a well-formed source-object id)
+			if endpoint.path == "/search/{collection}/near-object" && endpoint.method == http.MethodPost {
+				body = []byte(`{"id":"aa44bbee-ca5f-4db7-a412-5fc6a2300001"}`)
+			}
+			// aggregate's generated body fills the reserved fields, which 422
+			// before authz; an empty body (total count) reaches authz.
+			if endpoint.path == "/aggregate/{collection}" && endpoint.method == http.MethodPost {
+				body = []byte(`{}`)
+			}
+
 			if endpoint.method == "POST" || endpoint.method == "PUT" || endpoint.method == "PATCH" || endpoint.method == "DELETE" {
-				req, err = http.NewRequest(endpoint.method, url, bytes.NewBuffer(endpoint.validGeneratedBodyData))
+				req, err = http.NewRequest(endpoint.method, url, bytes.NewBuffer(body))
 				require.Nil(t, err)
 				req.Header.Set("Content-Type", "application/json")
 

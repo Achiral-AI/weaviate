@@ -117,10 +117,34 @@ func makeHFreshConfig(t *testing.T) (*Config, ent.UserConfig) {
 	cfg.PrometheusMetrics = monitoring.GetMetrics()
 	cfg.PrometheusMetrics.Registerer.MustRegister()
 
+	setDelegatingTempThunk(cfg)
+
 	return cfg, ent.NewDefaultUserConfig()
 }
 
+// setDelegatingTempThunk satisfies the required TempVectorForIDWithViewThunk
+// by delegating to cfg.VectorForIDThunk at call time — tests assign their
+// fixture thunk after building the config, and the pooled read path picks it
+// up automatically. The vector is copied into the pooled container because
+// the caller may normalize the returned slice in place.
+func setDelegatingTempThunk(cfg *Config) {
+	cfg.TempVectorForIDWithViewThunk = func(ctx context.Context, id uint64, container *common.VectorSlice, view common.BucketView) ([]float32, error) {
+		vec, err := cfg.VectorForIDThunk(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if cap(container.Slice) < len(vec) {
+			container.Slice = make([]float32, len(vec))
+		}
+		container.Slice = container.Slice[:len(vec)]
+		copy(container.Slice, vec)
+		return container.Slice, nil
+	}
+}
+
 func makeHFreshWithConfig(t *testing.T, store *lsmkv.Store, cfg *Config, uc ent.UserConfig) *HFresh {
+	createObjectsBucket(t, store)
+
 	index, err := New(cfg, uc, store)
 	require.NoError(t, err)
 
@@ -144,8 +168,13 @@ func TestHFreshRecall(t *testing.T) {
 	store := testinghelpers.NewDummyStore(t)
 	cfg, ucfg := makeHFreshConfig(t)
 
-	vectors_size := 10_000
-	queries_size := 100
+	// Reduced from 10,000 for faster CI execution — but kept well above the
+	// split threshold: at 64 dims maxPostingSize is 1,490, so anything at or
+	// below ~1,500 vectors exercises at most one split and recall is measured
+	// against an effectively single-posting index. 5,000 forces several
+	// splits so recall runs on a real multi-posting layout.
+	vectors_size := 5_000
+	queries_size := 50
 	dimensions := 64
 	k := 10
 

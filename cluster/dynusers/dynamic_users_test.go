@@ -19,7 +19,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	cmd "github.com/weaviate/weaviate/cluster/proto/api"
@@ -28,47 +27,28 @@ import (
 	usecasesNamespaces "github.com/weaviate/weaviate/usecases/namespaces"
 )
 
-// newNamespacesMock returns an Exister mock that reports `known` as active
-// namespaces (Exists and IsActive both return true).
+// newNamespacesMock returns an Exister mock reporting every known name as an
+// active namespace; any other name is missing.
 func newNamespacesMock(t *testing.T, known ...string) *usecasesNamespaces.MockExister {
 	t.Helper()
-	m := &usecasesNamespaces.MockExister{}
-	m.Test(t)
-	set := make(map[string]struct{}, len(known))
+	states := make(map[string]cmd.NamespaceState, len(known))
 	for _, n := range known {
-		set[n] = struct{}{}
+		states[n] = cmd.NamespaceStateActive
 	}
-	m.On("Exists", mock.AnythingOfType("string")).Return(func(name string) bool {
-		_, ok := set[name]
-		return ok
-	}).Maybe()
-	m.On("IsActive", mock.AnythingOfType("string")).Return(func(name string) bool {
-		_, ok := set[name]
-		return ok
-	}).Maybe()
-	return m
+	return usecasesNamespaces.NewMockExisterInState(t, states)
 }
 
-// newNamespacesMockDeleting reports `name` as existing-but-deleting
-// (Exists=true, IsActive=false).
-func newNamespacesMockDeleting(t *testing.T, name string) *usecasesNamespaces.MockExister {
+// newTestManager builds a manager over a fresh directory and returns that
+// directory too: the backup-restore path writes the user file, so tests that
+// reopen or remove the store need the path.
+func newTestManager(t *testing.T, ns usecasesNamespaces.Exister) (*Manager, *apikey.DBUser, string) {
 	t.Helper()
-	m := &usecasesNamespaces.MockExister{}
-	m.Test(t)
-	m.On("Exists", mock.AnythingOfType("string")).Return(func(n string) bool {
-		return n == name
-	}).Maybe()
-	m.On("IsActive", mock.AnythingOfType("string")).Return(false).Maybe()
-	return m
-}
-
-func newTestManager(t *testing.T, ns usecasesNamespaces.Exister) (*Manager, *apikey.DBUser) {
-	t.Helper()
+	dir := t.TempDir()
 	logger, _ := test.NewNullLogger()
 	logger.SetLevel(logrus.DebugLevel)
-	dynUser, err := apikey.NewDBUser(t.TempDir(), false, logger)
+	dynUser, err := apikey.NewDBUser(dir, false, logger, ns)
 	require.NoError(t, err)
-	return NewManager(dynUser, ns, false, logger), dynUser
+	return NewManager(dynUser, ns, false, logger), dynUser, dir
 }
 
 func mustMarshalJSON(t *testing.T, v any) []byte {
@@ -80,11 +60,15 @@ func mustMarshalJSON(t *testing.T, v any) []byte {
 
 func TestNewManager_NilNamespacesPanics(t *testing.T) {
 	logger, _ := test.NewNullLogger()
-	dynUser, err := apikey.NewDBUser(t.TempDir(), false, logger)
+	dynUser, err := apikey.NewDBUser(t.TempDir(), false, logger, newNamespacesMock(t))
 	require.NoError(t, err)
 	assert.Panics(t, func() { NewManager(dynUser, nil, false, logger) })
 }
 
+// TestManager_CreateUser pins that the apply persists the user in every
+// namespace state. The state check lives in Store.admitPropose, ahead of the
+// RAFT append, so the apply must not re-adjudicate it: a refusal here would have
+// a binary without the check create the user a binary with it rejects.
 func TestManager_CreateUser(t *testing.T) {
 	_, hash, identifier, err := keys.CreateApiKeyAndHash()
 	require.NoError(t, err)
@@ -93,35 +77,48 @@ func TestManager_CreateUser(t *testing.T) {
 		name      string
 		namespace string
 		makeMock  func(t *testing.T) *usecasesNamespaces.MockExister
-		wantErrIs error
 	}{
 		{
-			name:      "active namespace passes",
+			name:      "active namespace",
 			namespace: "ns1",
 			makeMock:  func(t *testing.T) *usecasesNamespaces.MockExister { return newNamespacesMock(t, "ns1") },
 		},
 		{
-			name:      "empty namespace skips check",
+			name:      "empty namespace",
 			namespace: "",
 			makeMock:  func(t *testing.T) *usecasesNamespaces.MockExister { return newNamespacesMock(t) },
 		},
 		{
-			name:      "missing namespace returns ErrNamespaceGone",
+			name:      "missing namespace",
 			namespace: "ns1",
 			makeMock:  func(t *testing.T) *usecasesNamespaces.MockExister { return newNamespacesMock(t) },
-			wantErrIs: usecasesNamespaces.ErrNamespaceGone,
 		},
 		{
-			name:      "deleting namespace returns ErrNamespaceDeleting",
+			name:      "deleting namespace",
 			namespace: "ns1",
-			makeMock:  func(t *testing.T) *usecasesNamespaces.MockExister { return newNamespacesMockDeleting(t, "ns1") },
-			wantErrIs: usecasesNamespaces.ErrNamespaceDeleting,
+			makeMock: func(t *testing.T) *usecasesNamespaces.MockExister {
+				return usecasesNamespaces.NewMockExisterInState(t, map[string]cmd.NamespaceState{"ns1": cmd.NamespaceStateDeleting})
+			},
+		},
+		{
+			name:      "suspended namespace",
+			namespace: "ns1",
+			makeMock: func(t *testing.T) *usecasesNamespaces.MockExister {
+				return usecasesNamespaces.NewMockExisterInState(t, map[string]cmd.NamespaceState{"ns1": cmd.NamespaceStateSuspended})
+			},
+		},
+		{
+			name:      "resuming namespace",
+			namespace: "ns1",
+			makeMock: func(t *testing.T) *usecasesNamespaces.MockExister {
+				return usecasesNamespaces.NewMockExisterInState(t, map[string]cmd.NamespaceState{"ns1": cmd.NamespaceStateResuming})
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			m, dynUser := newTestManager(t, tc.makeMock(t))
+			m, dynUser, _ := newTestManager(t, tc.makeMock(t))
 
 			apply := &cmd.ApplyRequest{SubCommand: mustMarshalJSON(t, cmd.CreateUsersRequest{
 				UserId:         "u1",
@@ -130,14 +127,7 @@ func TestManager_CreateUser(t *testing.T) {
 				Namespace:      tc.namespace,
 				CreatedAt:      time.Now(),
 			})}
-			err := m.CreateUser(apply)
-			if tc.wantErrIs != nil {
-				require.ErrorIs(t, err, tc.wantErrIs)
-				users, _ := dynUser.GetUsers("u1")
-				assert.Empty(t, users, "user must not be persisted on rejection")
-				return
-			}
-			require.NoError(t, err)
+			require.NoError(t, m.CreateUser(apply))
 			users, err := dynUser.GetUsers("u1")
 			require.NoError(t, err)
 			require.NotNil(t, users["u1"])
@@ -156,7 +146,7 @@ func TestManager_CreateUser_NamespacesEnabledRejectsEmpty(t *testing.T) {
 
 	ns := newNamespacesMock(t)
 	logger, _ := test.NewNullLogger()
-	dynUser, err := apikey.NewDBUser(t.TempDir(), false, logger)
+	dynUser, err := apikey.NewDBUser(t.TempDir(), false, logger, ns)
 	require.NoError(t, err)
 	m := NewManager(dynUser, ns, true, logger)
 
@@ -197,7 +187,7 @@ func TestManager_MalformedJSON(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			m, _ := newTestManager(t, newNamespacesMock(t))
+			m, _, _ := newTestManager(t, newNamespacesMock(t))
 			err := tc.call(m)
 			require.Error(t, err)
 			assert.ErrorIs(t, err, ErrBadRequest)
@@ -206,7 +196,7 @@ func TestManager_MalformedJSON(t *testing.T) {
 }
 
 func TestManager_CheckUserIdentifierExists(t *testing.T) {
-	m, _ := newTestManager(t, newNamespacesMock(t))
+	m, _, _ := newTestManager(t, newNamespacesMock(t))
 
 	_, hash, identifier, err := keys.CreateApiKeyAndHash()
 	require.NoError(t, err)
@@ -287,7 +277,7 @@ func TestManager_DeleteUsersInNamespace(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			m, dyn := newTestManager(t, newNamespacesMock(t, tc.known...))
+			m, dyn, _ := newTestManager(t, newNamespacesMock(t, tc.known...))
 			for _, s := range tc.seeds {
 				seed(t, m, s.id, s.namespace)
 			}

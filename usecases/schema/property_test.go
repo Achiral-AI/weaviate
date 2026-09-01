@@ -40,7 +40,6 @@ func TestHandler_AddProperty(t *testing.T) {
 			ReplicationConfig: &models.ReplicationConfig{Factor: 1},
 		}
 		fakeSchemaManager.On("AddClass", mock.Anything, mock.Anything).Return(nil)
-		fakeSchemaManager.On("QueryCollectionsCount", "").Return(0, nil)
 		fakeSchemaManager.On("ReadOnlyClass", class.Class).Return(&class)
 		_, _, err := handler.AddClass(ctx, nil, &class)
 		require.NoError(t, err)
@@ -99,7 +98,6 @@ func TestHandler_AddProperty(t *testing.T) {
 			ReplicationConfig: &models.ReplicationConfig{Factor: 1},
 		}
 		fakeSchemaManager.On("AddClass", mock.Anything, mock.Anything).Return(nil)
-		fakeSchemaManager.On("QueryCollectionsCount", "").Return(0, nil)
 		fakeSchemaManager.On("ReadOnlyClass", class.Class).Return(&class)
 		_, _, err := handler.AddClass(ctx, nil, &class)
 		require.NoError(t, err)
@@ -151,7 +149,6 @@ func TestHandler_AddProperty_ReservedSuffix(t *testing.T) {
 					ReplicationConfig: &models.ReplicationConfig{Factor: 1},
 				}
 				fakeSchemaManager.On("AddClass", mock.Anything, mock.Anything).Return(nil)
-				fakeSchemaManager.On("QueryCollectionsCount", "").Return(0, nil)
 				fakeSchemaManager.On("ReadOnlyClass", class.Class).Return(class)
 				_, _, err := handler.AddClass(ctx, nil, class)
 				require.NoError(t, err)
@@ -209,7 +206,6 @@ func TestHandler_AddProperty_Object(t *testing.T) {
 			ReplicationConfig: &models.ReplicationConfig{Factor: 1},
 		}
 		fakeSchemaManager.On("AddClass", mock.Anything, mock.Anything).Return(nil)
-		fakeSchemaManager.On("QueryCollectionsCount", "").Return(0, nil)
 		fakeSchemaManager.On("ReadOnlyClass", class.Class).Return(&class)
 		_, _, err := handler.AddClass(ctx, nil, &class)
 		require.NoError(t, err)
@@ -486,7 +482,6 @@ func TestHandler_AddProperty_Reference_Tokenization(t *testing.T) {
 	}
 	fakeSchemaManager.On("ReadOnlyClass", refClass.Class).Return(&refClass)
 	fakeSchemaManager.On("AddClass", mock.Anything, mock.Anything).Return(nil).Twice()
-	fakeSchemaManager.On("QueryCollectionsCount", "").Return(0, nil).Twice()
 	fakeSchemaManager.On("ReadOnlyClass", class.Class).Return(&class)
 	_, _, err := handler.AddClass(ctx, nil, &class)
 	require.NoError(t, err)
@@ -1266,15 +1261,17 @@ func TestDeleteClassPropertyIndex_FieldMaskScopedToTouchedFlag(t *testing.T) {
 
 	cases := []struct {
 		indexName string
-		wantField string
+		// Deleting searchable also clears the durable SearchableBlockmax
+		// stamp, so its mask carries two tags; the other two carry one.
+		wantFields []string
 		// fsmProp is built per-case because rangeFilters validation
 		// requires a numeric data type and forbids the searchable flag,
 		// while the text-typed property forbids rangeFilters.
 		fsmProp *models.Property
 	}{
 		{
-			indexName: "filterable",
-			wantField: command.PropertyFieldIndexFilterable,
+			indexName:  "filterable",
+			wantFields: []string{command.PropertyFieldIndexFilterable},
 			fsmProp: &models.Property{
 				Name:            "title",
 				DataType:        schema.DataTypeText.PropString(),
@@ -1284,19 +1281,20 @@ func TestDeleteClassPropertyIndex_FieldMaskScopedToTouchedFlag(t *testing.T) {
 			},
 		},
 		{
-			indexName: "searchable",
-			wantField: command.PropertyFieldIndexSearchable,
+			indexName:  "searchable",
+			wantFields: []string{command.PropertyFieldIndexSearchable, command.PropertyFieldSearchableBlockmax},
 			fsmProp: &models.Property{
-				Name:            "title",
-				DataType:        schema.DataTypeText.PropString(),
-				IndexFilterable: boolPtr(true),
-				IndexSearchable: boolPtr(true),
-				Tokenization:    "word",
+				Name:               "title",
+				DataType:           schema.DataTypeText.PropString(),
+				IndexFilterable:    boolPtr(true),
+				IndexSearchable:    boolPtr(true),
+				SearchableBlockmax: boolPtr(true),
+				Tokenization:       "word",
 			},
 		},
 		{
-			indexName: "rangeFilters",
-			wantField: command.PropertyFieldIndexRangeFilters,
+			indexName:  "rangeFilters",
+			wantFields: []string{command.PropertyFieldIndexRangeFilters},
 			fsmProp: &models.Property{
 				Name:              "size",
 				DataType:          schema.DataTypeNumber.PropString(),
@@ -1319,11 +1317,22 @@ func TestDeleteClassPropertyIndex_FieldMaskScopedToTouchedFlag(t *testing.T) {
 			sm.On("ReadOnlyClass", "Movies").Return(fsmClass)
 			sm.On("UpdateProperty", "Movies", mock.Anything,
 				mock.MatchedBy(func(fields []string) bool {
-					// Exactly one field tag, exactly the one the
-					// REST request touched. Anything else (empty
-					// mask → replace-all; multiple fields → could
-					// clobber unrelated state) is the regression.
-					return len(fields) == 1 && fields[0] == tc.wantField
+					// Exactly the tags the REST request touched, no more:
+					// an empty mask → replace-all, and any extra tag could
+					// clobber unrelated state.
+					if len(fields) != len(tc.wantFields) {
+						return false
+					}
+					got := map[string]bool{}
+					for _, f := range fields {
+						got[f] = true
+					}
+					for _, w := range tc.wantFields {
+						if !got[w] {
+							return false
+						}
+					}
+					return true
 				}),
 			).Return(nil)
 
@@ -1331,6 +1340,99 @@ func TestDeleteClassPropertyIndex_FieldMaskScopedToTouchedFlag(t *testing.T) {
 				"Movies", tc.fsmProp.Name, tc.indexName)
 			require.NoError(t, err)
 			sm.AssertExpectations(t)
+		})
+	}
+}
+
+// TestDeleteClassPropertyIndex_SearchableClearsBlockmaxStamp pins that
+// dropping the searchable index clears the durable SearchableBlockmax stamp
+// in the same masked write, so it can't outlive the index and resolve stale
+// truth on re-enable.
+func TestDeleteClassPropertyIndex_SearchableClearsBlockmaxStamp(t *testing.T) {
+	t.Parallel()
+	handler, sm := newTestHandlerWithNamespaces(t, false)
+
+	fsmProp := &models.Property{
+		Name:               "title",
+		DataType:           schema.DataTypeText.PropString(),
+		IndexSearchable:    boolPtr(true),
+		SearchableBlockmax: boolPtr(true),
+		Tokenization:       "word",
+	}
+	fsmClass := &models.Class{Class: "Movies", Vectorizer: "none", Properties: []*models.Property{fsmProp}}
+	sm.On("ReadOnlyClass", "Movies").Return(fsmClass)
+
+	var forwarded *models.Property
+	var forwardedFields []string
+	sm.On("UpdateProperty", "Movies", mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			forwarded = args.Get(1).(*models.Property)
+			forwardedFields = args.Get(2).([]string)
+		}).Return(nil)
+
+	err := handler.DeleteClassPropertyIndex(context.Background(), nil, "Movies", "title", "searchable")
+	require.NoError(t, err)
+
+	require.NotNil(t, forwarded)
+	require.Nil(t, forwarded.SearchableBlockmax,
+		"the blockmax stamp must be cleared when the searchable index is dropped")
+	require.Contains(t, forwardedFields, command.PropertyFieldSearchableBlockmax,
+		"the mask must include the stamp field so RAFT actually clears it")
+	require.NotNil(t, fsmProp.SearchableBlockmax,
+		"the FSM property's stamp pointer must stay untouched (mutation via a copy)")
+
+	sm.AssertExpectations(t)
+}
+
+// TestDeleteClassPropertyIndex_NoOpWhenFlagAlreadyOff pins that deleting an
+// already-off index succeeds without reaching RAFT.
+func TestDeleteClassPropertyIndex_NoOpWhenFlagAlreadyOff(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		indexName string
+		fsmProp   *models.Property
+	}{
+		{
+			indexName: "filterable",
+			fsmProp: &models.Property{
+				Name: "title", DataType: schema.DataTypeText.PropString(),
+				IndexFilterable: boolPtr(false), IndexSearchable: boolPtr(true), Tokenization: "word",
+			},
+		},
+		{
+			indexName: "searchable",
+			fsmProp: &models.Property{
+				Name: "title", DataType: schema.DataTypeText.PropString(),
+				IndexFilterable: boolPtr(true), IndexSearchable: boolPtr(false), Tokenization: "word",
+			},
+		},
+		{
+			indexName: "rangeFilters",
+			fsmProp: &models.Property{
+				Name: "size", DataType: schema.DataTypeNumber.PropString(),
+				IndexFilterable: boolPtr(true), IndexRangeFilters: boolPtr(false),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.indexName, func(t *testing.T) {
+			t.Parallel()
+			handler, sm := newTestHandlerWithNamespaces(t, false)
+
+			fsmClass := &models.Class{
+				Class:      "Movies",
+				Vectorizer: "none",
+				Properties: []*models.Property{tc.fsmProp},
+			}
+			sm.On("ReadOnlyClass", "Movies").Return(fsmClass)
+			// No UpdateProperty expectation: a no-op must not reach RAFT.
+
+			err := handler.DeleteClassPropertyIndex(context.Background(), nil,
+				"Movies", tc.fsmProp.Name, tc.indexName)
+			require.NoError(t, err)
+			sm.AssertNotCalled(t, "UpdateProperty", mock.Anything, mock.Anything, mock.Anything)
 		})
 	}
 }

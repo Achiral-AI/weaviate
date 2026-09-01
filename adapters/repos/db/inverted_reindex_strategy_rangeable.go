@@ -103,16 +103,6 @@ func (s *FilterableToRangeableStrategy) WriteToReindexBucket(shard ShardLike, bu
 	return nil
 }
 
-// ShouldProcessProperty always returns true. Scope is driven by the
-// reindexTaskConfig.selectedPropsByCollection set in the task constructor,
-// not by the live schema flag — during this migration IndexRangeFilters
-// is still false on every targeted property, and IndexFilterable may also
-// be false (the data is rebuilt from the objects bucket, not from
-// filterable).
-func (s *FilterableToRangeableStrategy) ShouldProcessProperty(property *inverted.Property) bool {
-	return true
-}
-
 func (s *FilterableToRangeableStrategy) MakeAddCallback(bucketNamer func(string) string,
 	propsByName map[string]struct{}, forTargetStrategy bool,
 ) onAddToPropertyValueIndex {
@@ -121,12 +111,11 @@ func (s *FilterableToRangeableStrategy) MakeAddCallback(bucketNamer func(string)
 		// IndexFilterable=false, and we still need to populate the
 		// rangeable bucket from the live write. Scope is enforced via
 		// propsByName.
-		if _, ok := propsByName[property.Name]; !ok {
+		bucket, bucketName, skip := resolveScopedDoubleWriteBucket(shard, property,
+			propsByName, bucketNamer, s.SourceBucketName, forTargetStrategy)
+		if skip {
 			return nil
 		}
-
-		bucketName := bucketNamer(property.Name)
-		bucket := shard.store.Bucket(bucketName)
 		for _, item := range property.Items {
 			if err := shard.addToPropertyRangeBucket(bucket, docID, item.Data); err != nil {
 				return fmt.Errorf("adding rangeable prop '%s' to bucket '%s': %w", item.Data, bucketName, err)
@@ -141,12 +130,11 @@ func (s *FilterableToRangeableStrategy) MakeDeleteCallback(bucketNamer func(stri
 ) onDeleteFromPropertyValueIndex {
 	return func(shard *Shard, docID uint64, property *inverted.Property) error {
 		// Don't gate on HasFilterableIndex — see MakeAddCallback.
-		if _, ok := propsByName[property.Name]; !ok {
+		bucket, bucketName, skip := resolveScopedDoubleWriteBucket(shard, property,
+			propsByName, bucketNamer, s.SourceBucketName, forTargetStrategy)
+		if skip {
 			return nil
 		}
-
-		bucketName := bucketNamer(property.Name)
-		bucket := shard.store.Bucket(bucketName)
 		for _, item := range property.Items {
 			if err := shard.deleteFromPropertyRangeBucket(bucket, docID, item.Data); err != nil {
 				return fmt.Errorf("deleting rangeable prop '%s' from bucket '%s': %w", item.Data, bucketName, err)

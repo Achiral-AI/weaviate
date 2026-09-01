@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/weaviate/weaviate/entities/models"
+	"github.com/weaviate/weaviate/entities/modelsext"
 	"github.com/weaviate/weaviate/entities/schema"
 	"github.com/weaviate/weaviate/entities/schema/test_utils"
 	"github.com/weaviate/weaviate/entities/search"
@@ -150,6 +151,34 @@ func Test_autoSchemaManager_determineType(t *testing.T) {
 			want: []schema.DataType{schema.DataTypeText},
 		},
 		{
+			// Passes the RFC3339 shape guard but fails the parse (month 13) - must
+			// still fall through to text, not be treated as a date.
+			name: "determine text for date-shaped invalid string",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled: runtime.NewDynamicValue(true),
+				},
+			},
+			args: args{
+				value: "2002-13-02T15:00:00Z",
+			},
+			want: []schema.DataType{schema.DataTypeText},
+		},
+		{
+			// Passes the uuid length guard (36) but fails the parse (non-hex) - must
+			// still fall through to text, not be treated as a uuid.
+			name: "determine text for uuid-shaped invalid string",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled: runtime.NewDynamicValue(true),
+				},
+			},
+			args: args{
+				value: "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+			},
+			want: []schema.DataType{schema.DataTypeText},
+		},
+		{
 			name: "determine date",
 			fields: fields{
 				config: config.AutoSchema{
@@ -185,6 +214,43 @@ func Test_autoSchemaManager_determineType(t *testing.T) {
 				value: "5b2cbe85c38a41f79e8c7406ff6d15aa",
 			},
 			want: []schema.DataType{schema.DataTypeUUID},
+		},
+		{
+			name: "determine uuid (braced)",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled: runtime.NewDynamicValue(true),
+				},
+			},
+			args: args{
+				value: "{5b2cbe85-c38a-41f7-9e8c-7406ff6d15aa}",
+			},
+			want: []schema.DataType{schema.DataTypeUUID},
+		},
+		{
+			name: "determine uuid (urn)",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled: runtime.NewDynamicValue(true),
+				},
+			},
+			args: args{
+				value: "urn:uuid:5b2cbe85-c38a-41f7-9e8c-7406ff6d15aa",
+			},
+			want: []schema.DataType{schema.DataTypeUUID},
+		},
+		{
+			name: "determine date with numeric offset",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled:     runtime.NewDynamicValue(true),
+					DefaultDate: "date",
+				},
+			},
+			args: args{
+				value: "2002-10-02T15:00:00+07:00",
+			},
+			want: []schema.DataType{schema.DataTypeDate},
 		},
 		{
 			name: "determine int",
@@ -405,6 +471,34 @@ func Test_autoSchemaManager_determineType(t *testing.T) {
 			want: []schema.DataType{schema.DataTypeUUIDArray},
 		},
 		{
+			name: "determine uuid array (braced and urn forms)",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled: runtime.NewDynamicValue(true),
+				},
+			},
+			args: args{
+				value: []interface{}{
+					"{5b2cbe85-c38a-41f7-9e8c-7406ff6d15aa}",
+					"urn:uuid:57a8564d-089b-4cd9-be39-56681605e0da",
+				},
+			},
+			want: []schema.DataType{schema.DataTypeUUIDArray},
+		},
+		{
+			name: "determine date array with numeric offset",
+			fields: fields{
+				config: config.AutoSchema{
+					Enabled:     runtime.NewDynamicValue(true),
+					DefaultDate: "date",
+				},
+			},
+			args: args{
+				value: []interface{}{"2002-10-02T15:00:00+07:00", "2002-10-02T15:01:00+07:00"},
+			},
+			want: []schema.DataType{schema.DataTypeDateArray},
+		},
+		{
 			name: "determine mixed string arrays, string first",
 			fields: fields{
 				config: config.AutoSchema{
@@ -586,6 +680,56 @@ func Test_autoSchemaManager_determineType(t *testing.T) {
 	}
 }
 
+func Test_couldBeRFC3339(t *testing.T) {
+	// Guard must accept every string time.Parse(RFC3339) can accept and may be
+	// broader; it must never reject a valid timestamp.
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "minimal Zulu", value: "2002-10-02T15:00:00Z", want: true},
+		{name: "numeric offset", value: "2002-10-02T15:00:00+07:00", want: true},
+		{name: "fractional seconds", value: "2002-10-02T15:00:00.123Z", want: true},
+		{name: "lowercase t accepted", value: "2002-10-02t15:00:00z", want: true},
+		{name: "too short", value: "2002-10-02T15:00:0", want: false},
+		{name: "wrong separator at 4", value: "2002/10-02T15:00:00Z", want: false},
+		{name: "wrong separator at 7", value: "2002-10/02T15:00:00Z", want: false},
+		{name: "wrong separator at 10", value: "2002-10-02 15:00:00Z", want: false},
+		{name: "plain text", value: "just a sentence value", want: false},
+		{name: "empty", value: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, couldBeRFC3339(tt.value))
+		})
+	}
+}
+
+func Test_couldBeUUID(t *testing.T) {
+	// Guard must accept every length uuid.Parse can accept (32, 36, 38, 45) and
+	// may be broader; it must never reject a valid UUID.
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "no hyphens (32)", value: "5b2cbe85c38a41f79e8c7406ff6d15aa", want: true},
+		{name: "canonical (36)", value: "5b2cbe85-c38a-41f7-9e8c-7406ff6d15aa", want: true},
+		{name: "braced (38)", value: "{5b2cbe85-c38a-41f7-9e8c-7406ff6d15aa}", want: true},
+		{name: "urn (45)", value: "urn:uuid:5b2cbe85-c38a-41f7-9e8c-7406ff6d15aa", want: true},
+		{name: "too short (31)", value: "5b2cbe85c38a41f79e8c7406ff6d15a", want: false},
+		{name: "too long (46)", value: "urn:uuid:5b2cbe85-c38a-41f7-9e8c-7406ff6d15aax", want: false},
+		{name: "plain text", value: "string", want: false},
+		{name: "empty", value: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, couldBeUUID(tt.value))
+		})
+	}
+}
+
 func Test_autoSchemaManager_autoSchema_emptyRequest(t *testing.T) {
 	// given
 	vectorRepo := &fakeVectorRepo{}
@@ -654,7 +798,7 @@ func Test_autoSchemaManager_autoSchema_create(t *testing.T) {
 	require.NotNil(t, schemaAfter.Objects)
 	assert.Equal(t, 1, len(schemaAfter.Objects.Classes))
 
-	class := (schemaAfter.Objects.Classes)[0]
+	class := schemaAfter.Objects.Classes[0]
 	assert.Equal(t, "Publication", class.Class)
 	assert.Equal(t, 5, len(class.Properties))
 	require.NotNil(t, getProperty(class.Properties, "name"))
@@ -672,9 +816,15 @@ func Test_autoSchemaManager_autoSchema_create(t *testing.T) {
 	require.NotNil(t, getProperty(class.Properties, "numberArray"))
 	assert.Equal(t, "numberArray", getProperty(class.Properties, "numberArray").Name)
 	assert.Equal(t, "number[]", getProperty(class.Properties, "numberArray").DataType[0])
-	assert.Equal(t, "hnsw", class.VectorIndexType)
-	assert.Equal(t, "none", class.Vectorizer)
-	assert.NotNil(t, class.VectorIndexConfig)
+	assert.Empty(t, class.VectorIndexType)
+	assert.Empty(t, class.Vectorizer)
+	assert.Nil(t, class.VectorIndexConfig)
+	require.Len(t, class.VectorConfig, 1)
+	defaultVector, ok := class.VectorConfig[modelsext.DefaultNamedVectorName]
+	require.True(t, ok)
+	assert.Equal(t, map[string]interface{}{"none": map[string]interface{}{}}, defaultVector.Vectorizer)
+	assert.Equal(t, "hnsw", defaultVector.VectorIndexType)
+	assert.NotNil(t, defaultVector.VectorIndexConfig)
 }
 
 func Test_autoSchemaManager_autoSchema_update(t *testing.T) {
@@ -726,10 +876,10 @@ func Test_autoSchemaManager_autoSchema_update(t *testing.T) {
 	schemaBefore := schemaManager.GetSchemaResponse
 	require.NotNil(t, schemaBefore.Objects)
 	assert.Equal(t, 1, len(schemaBefore.Objects.Classes))
-	assert.Equal(t, "Publication", (schemaBefore.Objects.Classes)[0].Class)
-	assert.Equal(t, 1, len((schemaBefore.Objects.Classes)[0].Properties))
-	assert.Equal(t, "age", (schemaBefore.Objects.Classes)[0].Properties[0].Name)
-	assert.Equal(t, "int", (schemaBefore.Objects.Classes)[0].Properties[0].DataType[0])
+	assert.Equal(t, "Publication", schemaBefore.Objects.Classes[0].Class)
+	assert.Equal(t, 1, len(schemaBefore.Objects.Classes[0].Properties))
+	assert.Equal(t, "age", schemaBefore.Objects.Classes[0].Properties[0].Name)
+	assert.Equal(t, "int", schemaBefore.Objects.Classes[0].Properties[0].DataType[0])
 
 	knownClasses := map[string]versioned.Class{
 		class.Class: {Version: 0, Class: class},
@@ -741,23 +891,23 @@ func Test_autoSchemaManager_autoSchema_update(t *testing.T) {
 	schemaAfter := schemaManager.GetSchemaResponse
 	require.NotNil(t, schemaAfter.Objects)
 	assert.Equal(t, 1, len(schemaAfter.Objects.Classes))
-	assert.Equal(t, "Publication", (schemaAfter.Objects.Classes)[0].Class)
-	assert.Equal(t, 5, len((schemaAfter.Objects.Classes)[0].Properties))
-	require.NotNil(t, getProperty((schemaAfter.Objects.Classes)[0].Properties, "age"))
-	assert.Equal(t, "age", getProperty((schemaAfter.Objects.Classes)[0].Properties, "age").Name)
-	assert.Equal(t, "int", getProperty((schemaAfter.Objects.Classes)[0].Properties, "age").DataType[0])
-	require.NotNil(t, getProperty((schemaAfter.Objects.Classes)[0].Properties, "name"))
-	assert.Equal(t, "name", getProperty((schemaAfter.Objects.Classes)[0].Properties, "name").Name)
-	assert.Equal(t, "text", getProperty((schemaAfter.Objects.Classes)[0].Properties, "name").DataType[0])
-	require.NotNil(t, getProperty((schemaAfter.Objects.Classes)[0].Properties, "publicationDate"))
-	assert.Equal(t, "publicationDate", getProperty((schemaAfter.Objects.Classes)[0].Properties, "publicationDate").Name)
-	assert.Equal(t, "date", getProperty((schemaAfter.Objects.Classes)[0].Properties, "publicationDate").DataType[0])
-	require.NotNil(t, getProperty((schemaAfter.Objects.Classes)[0].Properties, "textArray"))
-	assert.Equal(t, "textArray", getProperty((schemaAfter.Objects.Classes)[0].Properties, "textArray").Name)
-	assert.Equal(t, "text[]", getProperty((schemaAfter.Objects.Classes)[0].Properties, "textArray").DataType[0])
-	require.NotNil(t, getProperty((schemaAfter.Objects.Classes)[0].Properties, "numberArray"))
-	assert.Equal(t, "numberArray", getProperty((schemaAfter.Objects.Classes)[0].Properties, "numberArray").Name)
-	assert.Equal(t, "int[]", getProperty((schemaAfter.Objects.Classes)[0].Properties, "numberArray").DataType[0])
+	assert.Equal(t, "Publication", schemaAfter.Objects.Classes[0].Class)
+	assert.Equal(t, 5, len(schemaAfter.Objects.Classes[0].Properties))
+	require.NotNil(t, getProperty(schemaAfter.Objects.Classes[0].Properties, "age"))
+	assert.Equal(t, "age", getProperty(schemaAfter.Objects.Classes[0].Properties, "age").Name)
+	assert.Equal(t, "int", getProperty(schemaAfter.Objects.Classes[0].Properties, "age").DataType[0])
+	require.NotNil(t, getProperty(schemaAfter.Objects.Classes[0].Properties, "name"))
+	assert.Equal(t, "name", getProperty(schemaAfter.Objects.Classes[0].Properties, "name").Name)
+	assert.Equal(t, "text", getProperty(schemaAfter.Objects.Classes[0].Properties, "name").DataType[0])
+	require.NotNil(t, getProperty(schemaAfter.Objects.Classes[0].Properties, "publicationDate"))
+	assert.Equal(t, "publicationDate", getProperty(schemaAfter.Objects.Classes[0].Properties, "publicationDate").Name)
+	assert.Equal(t, "date", getProperty(schemaAfter.Objects.Classes[0].Properties, "publicationDate").DataType[0])
+	require.NotNil(t, getProperty(schemaAfter.Objects.Classes[0].Properties, "textArray"))
+	assert.Equal(t, "textArray", getProperty(schemaAfter.Objects.Classes[0].Properties, "textArray").Name)
+	assert.Equal(t, "text[]", getProperty(schemaAfter.Objects.Classes[0].Properties, "textArray").DataType[0])
+	require.NotNil(t, getProperty(schemaAfter.Objects.Classes[0].Properties, "numberArray"))
+	assert.Equal(t, "numberArray", getProperty(schemaAfter.Objects.Classes[0].Properties, "numberArray").Name)
+	assert.Equal(t, "int[]", getProperty(schemaAfter.Objects.Classes[0].Properties, "numberArray").DataType[0])
 }
 
 func Test_autoSchemaManager_getProperties(t *testing.T) {

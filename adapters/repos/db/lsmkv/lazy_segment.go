@@ -244,6 +244,11 @@ func (s *lazySegment) markForDeletion() error {
 	return s.segment.markForDeletion()
 }
 
+func (s *lazySegment) markForDeletionExceptSegment() error {
+	s.mustLoad()
+	return s.segment.markForDeletionExceptSegment()
+}
+
 func (s *lazySegment) MergeTombstones(other *sroar.Bitmap) (*sroar.Bitmap, error) {
 	s.mustLoad()
 	return s.segment.MergeTombstones(other)
@@ -267,6 +272,11 @@ func (s *lazySegment) newCursor() innerCursorReplaceAllKeys {
 func (s *lazySegment) newReplaceCursorReusable() *segmentCursorReplaceReusable {
 	s.mustLoad()
 	return s.segment.newReplaceCursorReusable()
+}
+
+func (s *lazySegment) newReplaceCursorDigestReusable(valuePrefixLen int) *segmentCursorReplaceReusable {
+	s.mustLoad()
+	return s.segment.newReplaceCursorDigestReusable(valuePrefixLen)
 }
 
 func (s *lazySegment) newCursorWithSecondaryIndex(pos int) *segmentCursorReplace {
@@ -304,6 +314,21 @@ func (s *lazySegment) quantileKeys(q int) [][]byte {
 	return s.segment.quantileKeys(q)
 }
 
+func (s *lazySegment) scanIndexNodes(from, to int, fn func(n segmentNodeRange) error) error {
+	s.mustLoad()
+	return s.segment.scanIndexNodes(from, to, fn)
+}
+
+func (s *lazySegment) indexNodeSplits(parts int) [][2]int {
+	s.mustLoad()
+	return s.segment.indexNodeSplits(parts)
+}
+
+func (s *lazySegment) readRange(offset nodeOffset, operation string, buf *[]byte) ([]byte, error) {
+	s.mustLoad()
+	return s.segment.readRange(offset, operation, buf)
+}
+
 func (s *lazySegment) ReadOnlyTombstones() (*sroar.Bitmap, error) {
 	s.mustLoad()
 	return s.segment.ReadOnlyTombstones()
@@ -320,10 +345,10 @@ func (s *lazySegment) roaringSetGet(key []byte, bitmapBufPool roaringset.BitmapB
 	return s.segment.roaringSetGet(key, bitmapBufPool)
 }
 
-func (s *lazySegment) roaringSetMergeWith(key []byte, input roaringset.BitmapLayer, bitmapBufPool roaringset.BitmapBufPool,
+func (s *lazySegment) roaringSetMergeWith(key []byte, input roaringset.BitmapLayer, bitmapBufPool roaringset.BitmapBufPool, maxConc int,
 ) error {
 	s.mustLoad()
-	return s.segment.roaringSetMergeWith(key, input, bitmapBufPool)
+	return s.segment.roaringSetMergeWith(key, input, bitmapBufPool, maxConc)
 }
 
 func (s *lazySegment) numberFromPath(re *regexp.Regexp) (int, bool) {
@@ -415,11 +440,11 @@ func (s *lazySegment) getCountNetAdditions() int {
 	return s.segment.getCountNetAdditions()
 }
 
-func (s *lazySegment) existsKey(key []byte) (bool, error) {
+func (s *lazySegment) indexContainsKey(key []byte) (bool, error) {
 	if err := s.load(); err != nil {
-		return false, fmt.Errorf("lazySegment::existsKey: %w", err)
+		return false, fmt.Errorf("lazySegment::indexContainsKey: %w", err)
 	}
-	return s.segment.existsKey(key)
+	return s.segment.indexContainsKey(key)
 }
 
 func (s *lazySegment) exists(key []byte) error {

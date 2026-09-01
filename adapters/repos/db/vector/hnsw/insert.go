@@ -256,8 +256,11 @@ func (h *hnsw) AddBatch(ctx context.Context, ids []uint64, vectors [][]float32) 
 
 		h.metrics.InsertVector()
 
-		vector = h.normalizeVec(vector)
+		vector, release := h.normalizeVecForInsert(vector)
 		err := h.addOne(ctx, vector, node)
+		if release != nil {
+			release()
+		}
 		if err != nil {
 			return err
 		}
@@ -299,7 +302,7 @@ func (h *hnsw) AddMultiBatch(ctx context.Context, docIDs []uint64, vectors [][][
 			docIDBytes := make([]byte, 8)
 			binary.BigEndian.PutUint64(docIDBytes, docIDs[i])
 			muveraBytes := multivector.MuveraBytesFromFloat32(processedVectors[i])
-			if err := h.store.Bucket(h.id+"_muvera_vectors").Put(docIDBytes, muveraBytes); err != nil {
+			if err := h.store.Bucket(helpers.MuveraBucketName(h.id)).Put(docIDBytes, muveraBytes); err != nil {
 				return errors.Wrap(err, fmt.Sprintf("failed to put %s_muvera_vectors into the bucket", h.id))
 			}
 		}
@@ -332,7 +335,32 @@ func (h *hnsw) AddMultiBatch(ctx context.Context, docIDs []uint64, vectors [][][
 		return err
 	}
 
+	// purge state left by a previously failed attempt so whole-task retries
+	var purge []uint64
+	func() {
+		h.RLock()
+		defer h.RUnlock()
+		for _, docID := range docIDs {
+			if _, ok := h.docIDVectors[docID]; ok {
+				purge = append(purge, docID)
+			}
+		}
+	}()
+	if len(purge) > 0 {
+		if err := h.DeleteMulti(purge...); err != nil {
+			return errors.Wrap(err, "purge partially indexed docs before re-insert")
+		}
+	}
+
+	seenInBatch := make(map[uint64]struct{}, len(docIDs))
 	for i, docID := range docIDs {
+		if _, dup := seenInBatch[docID]; dup {
+			if err := h.DeleteMulti(docID); err != nil {
+				return errors.Wrapf(err, "purge duplicate doc %d before re-insert", docID)
+			}
+		}
+		seenInBatch[docID] = struct{}{}
+
 		numVectors := len(vectors[i])
 		levels := make([]uint8, numVectors)
 		for j := range numVectors {
@@ -396,7 +424,7 @@ func (h *hnsw) AddMultiBatch(ctx context.Context, docIDs []uint64, vectors [][][
 			binary.BigEndian.PutUint64(nodeIDBytes, nodeId)
 			docIDBytes := make([]byte, 8)
 			binary.BigEndian.PutUint64(docIDBytes, docID)
-			err := h.store.Bucket(h.id+"_mv_mappings").Put(nodeIDBytes, docIDBytes)
+			err := h.store.Bucket(helpers.MVMappingsBucketName(h.id)).Put(nodeIDBytes, docIDBytes)
 			if err != nil {
 				return errors.Wrap(err, fmt.Sprintf("failed to put %s_mv_mappings into the bucket", h.id))
 			}

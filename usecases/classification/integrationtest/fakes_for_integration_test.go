@@ -100,7 +100,7 @@ func (f *fakeSchemaGetter) TenantsShards(_ context.Context, class string, tenant
 	return res, nil
 }
 
-func (f *fakeSchemaGetter) OptimisticTenantStatus(_ context.Context, class string, tenant string) (map[string]string, error) {
+func (f *fakeSchemaGetter) OptimisticTenantStatus(_ context.Context, class string, tenant string, _ bool) (map[string]string, error) {
 	res := map[string]string{}
 	res[tenant] = models.TenantActivityStatusHOT
 	return res, nil
@@ -478,7 +478,7 @@ func (f *fakeRemoteClient) SearchShard(ctx context.Context, hostName, indexName,
 	shardName string, vector []models.Vector, targetVector []string, distance float32, limit int, filters *filters.LocalFilter,
 	keywordRanking *searchparams.KeywordRanking, sort []filters.Sort,
 	cursor *filters.Cursor, groupBy *searchparams.GroupBy, additional additional.Properties, targetCombination *dto.TargetCombination,
-	properties []string, selection *searchparams.Selection,
+	properties []string,
 ) ([]*storobj.Object, []float32, []helpers.ShardQueryProfile, error) {
 	return nil, nil, nil, nil
 }
@@ -638,7 +638,7 @@ func (c *fakeReplicationClient) FindUUIDs(ctx context.Context, host, index, shar
 
 func (c *fakeReplicationClient) DigestObjectsInRange(ctx context.Context, host, index, shard string,
 	initialUUID, finalUUID strfmt.UUID, limit int,
-) ([]types.RepairResponse, error) {
+) ([]types.RepairDigest, error) {
 	return nil, nil
 }
 
@@ -649,8 +649,8 @@ func (c *fakeReplicationClient) HashTreeLevel(ctx context.Context, host, index, 
 }
 
 func (c *fakeReplicationClient) CompareDigests(ctx context.Context, host, index, shard string,
-	digests []types.RepairResponse,
-) ([]types.RepairResponse, error) {
+	digests []types.RepairDigest,
+) ([]types.RepairDigest, error) {
 	return nil, nil
 }
 

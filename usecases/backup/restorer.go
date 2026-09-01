@@ -23,7 +23,6 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
-	"github.com/weaviate/weaviate/cluster/fsm"
 	"github.com/weaviate/weaviate/entities/backup"
 	enterrors "github.com/weaviate/weaviate/entities/errors"
 	"github.com/weaviate/weaviate/entities/models"
@@ -37,8 +36,6 @@ type restorer struct {
 	node              string // node name
 	logger            logrus.FieldLogger
 	sourcer           Sourcer
-	rbacSourcer       fsm.Snapshotter
-	dynUserSourcer    dynUserSnapshotter
 	backends          BackupBackendProvider
 	namespacesEnabled bool
 	shardSyncChan
@@ -51,15 +48,12 @@ type restorer struct {
 }
 
 func newRestorer(node string, logger logrus.FieldLogger,
-	sourcer Sourcer, rbacSourcer fsm.Snapshotter, dynUserSourcer dynUserSnapshotter,
-	backends BackupBackendProvider, namespacesEnabled bool,
+	sourcer Sourcer, backends BackupBackendProvider, namespacesEnabled bool,
 ) *restorer {
 	return &restorer{
 		node:              node,
 		logger:            logger,
 		sourcer:           sourcer,
-		rbacSourcer:       rbacSourcer,
-		dynUserSourcer:    dynUserSourcer,
 		backends:          backends,
 		namespacesEnabled: namespacesEnabled,
 		shardSyncChan:     shardSyncChan{coordChan: make(chan interface{}, 5)},
@@ -71,10 +65,7 @@ func (r *restorer) restore(
 	desc *backup.BackupDescriptor,
 	store nodeStore,
 ) (CanCommitResponse, error) {
-	expiration := req.Duration
-	if expiration > _TimeoutShardCommit {
-		expiration = _TimeoutShardCommit
-	}
+	expiration := min(req.Duration, _TimeoutShardCommit)
 	ret := CanCommitResponse{
 		Method:  OpCreate,
 		ID:      req.ID,
@@ -103,7 +94,9 @@ func (r *restorer) restore(
 			StartedAt: time.Now().UTC(),
 			Status:    backup.Transferring,
 		}
+		backgroundDone := monitoring.GetBackgroundProcessMetrics().Started(monitoring.ProcessRestore)
 		defer func() {
+			backgroundDone()
 			status.CompletedAt = time.Now().UTC()
 			if err == nil {
 				status.Status = backup.Success
@@ -114,6 +107,7 @@ func (r *restorer) restore(
 					status.Status = backup.Cancelled
 				} else {
 					status.Status = backup.Failed
+					monitoring.GetBackgroundProcessMetrics().Failed(monitoring.ProcessRestore)
 				}
 			}
 			r.restoreStatusMap.Store(basePath(req.Backend, req.ID), status)
@@ -135,7 +129,7 @@ func (r *restorer) restore(
 		overrideBucket := req.Bucket
 		overridePath := req.Path
 
-		err = r.restoreAll(ctx, desc, req.CPUPercentage, store, overrideBucket, overridePath, req.RbacRestoreOption, req.UserRestoreOption, !r.namespacesEnabled)
+		err = r.restoreAll(ctx, desc, req.CPUPercentage, store, overrideBucket, overridePath, !r.namespacesEnabled)
 		logFields := logrus.Fields{"action": "restore", "backup_id": req.ID}
 		if err != nil {
 			r.logger.WithFields(logFields).Error(err)
@@ -149,14 +143,15 @@ func (r *restorer) restore(
 }
 
 // restoreAll restores classes in temporary directories on the filesystem.
-// The final backup restoration is orchestrated by the raft store.
+// The final backup restoration is orchestrated by the raft store. Roles and
+// dynamic users are not restored here: the coordinator applies them
+// cluster-wide through one RAFT entry once staging has committed.
 func (r *restorer) restoreAll(ctx context.Context,
 	desc *backup.BackupDescriptor, cpuPercentage int,
-	store nodeStore, overrideBucket, overridePath, rbacRestoreOption, usersRestoreOption string,
+	store nodeStore, overrideBucket, overridePath string,
 	stripNamespaces bool,
 ) error {
 	compressionType := desc.GetCompressionType()
-	compressed := desc.Version > version1
 	r.lastOp.set(backup.Transferring)
 
 	// Check for cancellation before starting restore operations
@@ -165,35 +160,13 @@ func (r *restorer) restoreAll(ctx context.Context,
 		return fmt.Errorf("restore cancelled: %w", err)
 	}
 
-	if r.dynUserSourcer != nil && len(desc.UserBackups) > 0 && usersRestoreOption != models.RestoreConfigUsersOptionsNoRestore {
-		if err := r.dynUserSourcer.Restore(desc.UserBackups, stripNamespaces); err != nil {
-			return fmt.Errorf("restore users: %w", err)
-		}
-		// Check for cancellation after User restore
-		if err := ctx.Err(); err != nil {
-			r.lastOp.set(backup.Cancelled)
-			return fmt.Errorf("restore cancelled: %w", err)
-		}
-	}
-
-	if r.rbacSourcer != nil && len(desc.RbacBackups) > 0 && rbacRestoreOption != models.RestoreConfigRolesOptionsNoRestore {
-		if err := r.rbacSourcer.Restore(desc.RbacBackups); err != nil {
-			return fmt.Errorf("restore rbac: %w", err)
-		}
-		// Check for cancellation after RBAC restore
-		if err := ctx.Err(); err != nil {
-			r.lastOp.set(backup.Cancelled)
-			return fmt.Errorf("restore cancelled: %w", err)
-		}
-	}
-
 	for _, cdesc := range desc.Classes {
 		// Check for cancellation before each class restore
 		if err := ctx.Err(); err != nil {
 			r.lastOp.set(backup.Cancelled)
 			return fmt.Errorf("restore cancelled: %w", err)
 		}
-		if err := r.restoreOne(ctx, &cdesc, desc.ServerVersion, compressionType, compressed, cpuPercentage, store, overrideBucket, overridePath, stripNamespaces); err != nil {
+		if err := r.restoreOne(ctx, &cdesc, desc.ServerVersion, compressionType, cpuPercentage, store, overrideBucket, overridePath, stripNamespaces); err != nil {
 			if errors.Is(err, context.Canceled) {
 				r.lastOp.set(backup.Cancelled)
 				return fmt.Errorf("restore cancelled: %w", err)
@@ -218,7 +191,7 @@ func getType(myvar interface{}) string {
 
 func (r *restorer) restoreOne(ctx context.Context,
 	desc *backup.ClassDescriptor, serverVersion string, compressionType backup.CompressionType,
-	compressed bool, cpuPercentage int, store nodeStore,
+	cpuPercentage int, store nodeStore,
 	overrideBucket, overridePath string,
 	stripNamespaces bool,
 ) (err error) {
@@ -232,7 +205,7 @@ func (r *restorer) restoreOne(ctx context.Context,
 		defer timer.ObserveDuration()
 	}
 
-	fw := newFileWriter(r.sourcer, store, compressed, r.logger).
+	fw := newFileWriter(r.sourcer, store, r.logger).
 		WithPoolPercentage(cpuPercentage)
 
 	// Pre-v1.23 versions store files in a flat format
@@ -278,7 +251,7 @@ func (r *restorer) status(backend, ID string) (Status, error) {
 
 func (r *restorer) validate(ctx context.Context, store *nodeStore, req *Request) (*backup.BackupDescriptor, []string, error) {
 	destPath := store.HomeDir(req.Bucket, req.Path)
-	meta, err := store.Meta(ctx, req.ID, req.Bucket, req.Path, true)
+	meta, err := store.Meta(ctx, req.ID, req.Bucket, req.Path)
 	if err != nil {
 		nerr := backup.ErrNotFound{}
 		if errors.As(err, &nerr) {
@@ -294,11 +267,11 @@ func (r *restorer) validate(ctx context.Context, store *nodeStore, req *Request)
 		err = fmt.Errorf("invalid backup in restorer %s status: %s", destPath, meta.Status)
 		return nil, nil, err
 	}
-	if err := meta.Validate(meta.Version > version1); err != nil {
-		return nil, nil, fmt.Errorf("corrupted backup file: %w", err)
+	if err := checkRestorableVersion(meta.Version, meta.ServerVersion); err != nil {
+		return nil, nil, err
 	}
-	if v := meta.Version; v[0] > Version[0] {
-		return nil, nil, fmt.Errorf("%s: %s > %s", errMsgHigherVersion, v, Version)
+	if err := meta.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("corrupted backup file: %w", err)
 	}
 	cs := meta.List()
 	if len(req.Classes) > 0 {

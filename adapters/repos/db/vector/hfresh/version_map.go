@@ -12,6 +12,7 @@
 package hfresh
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 
@@ -28,7 +29,7 @@ const (
 var ErrVersionIncrementFailed = errors.New("version increment failed")
 
 // A VectorVersion is a 1-byte value structured as follows:
-// - 7 bits for the version number
+// - 7 bits for the version number (1-127; 0 is reserved, see Increment)
 // - 1 bit for the tombstone flag (0 = alive, 1 = deleted)
 // TODO: versions can wrap around after 127 updates,
 // we need a mechanism to handle this in the future (e.g. during snapshots perhaps, etc.)
@@ -49,7 +50,11 @@ func (ve VectorVersion) Increment() VectorVersion {
 	if counter < 127 {
 		counter++
 	} else {
-		counter = 0 // wraparound behavior
+		// wrap to 1, never 0: the in-memory paged array uses 0 as its
+		// "empty slot" sentinel, so a live version of 0 would be
+		// indistinguishable from a never-loaded entry and could be rolled
+		// back to an older persisted value by loadInto or Warmup
+		counter = 1
 	}
 
 	return VectorVersion(delBit | counter)
@@ -60,136 +65,136 @@ var v1 = VectorVersion(0).Increment()
 // VersionMap keeps track of the version of each vector.
 // It uses a combination of an LSMKV store for persistence and an in-memory
 // cache for fast access.
+//
+// Locking is two-tier so that readers never wait on disk:
+//   - locks guards the in-memory pages only; every hold is nanoseconds.
+//     Search scans take it read-side for every candidate, so no LSM
+//     operation is ever performed while holding it.
+//   - persistLocks serializes store writes per vector among writers. Each
+//     persist re-reads the current memory value under the read lock, so the
+//     last persist among racing writers always lands the newest value and
+//     memory and store converge.
 type VersionMap struct {
-	data  *common.GroupedPagedArray[VectorVersion]
-	locks *common.ShardedRWLocks
-	store *VersionStore
+	data         *common.GroupedPagedArray[VectorVersion]
+	locks        *common.ShardedRWLocks
+	persistLocks *common.ShardedLocks
+	store        *VersionStore
 }
 
 func NewVersionMap(bucket *lsmkv.Bucket) *VersionMap {
 	return &VersionMap{
-		data:  common.NewGroupedPagedArray[VectorVersion](16*1024, 64*1024), // 1 billion entries with 64k per page
-		locks: common.NewShardedRWLocks(512),
-		store: NewVersionStore(bucket),
+		data:         common.NewGroupedPagedArray[VectorVersion](16*1024, 64*1024), // 1 billion entries with 64k per page
+		locks:        common.NewShardedRWLocks(512),
+		persistLocks: common.NewShardedLocks(512),
+		store:        NewVersionStore(bucket),
 	}
 }
 
-// Get returns the size of the vector with the given ID.
+// Get returns the version of the vector with the given ID.
 func (v *VersionMap) Get(ctx context.Context, vectorID uint64) (VectorVersion, error) {
 	page, slot := v.data.GetPageFor(vectorID)
-	if page == nil {
-		// not in cache, check store
-		version, err := v.store.Get(ctx, vectorID)
-		if err != nil && !errors.Is(err, ErrVectorNotFound) {
-			return 0, errors.Wrapf(err, "failed to get version for vector %d", vectorID)
-		}
-		if errors.Is(err, ErrVectorNotFound) {
-			version = v1
-		}
-
-		// update cache
-		page, slot := v.data.EnsurePageFor(vectorID)
-		v.locks.Lock(vectorID)
-		page[slot] = version
-		v.locks.Unlock(vectorID)
-
-		return version, nil
-	}
-
-	v.locks.RLock(vectorID)
-	version := page[slot]
-	v.locks.RUnlock(vectorID)
-
-	if version == 0 {
-		v.locks.Lock(vectorID)
-		defer v.locks.Unlock(vectorID)
-
-		// double-check after acquiring the lock
-		version = page[slot]
+	if page != nil {
+		v.locks.RLock(vectorID)
+		version := page[slot]
+		v.locks.RUnlock(vectorID)
 		if version != 0 {
 			return version, nil
 		}
-
-		// not in cache, check store
-		var err error
-		version, err = v.store.Get(ctx, vectorID)
-		if err != nil && !errors.Is(err, ErrVectorNotFound) {
-			return 0, errors.Wrapf(err, "failed to get version for vector %d", vectorID)
-		}
-		if errors.Is(err, ErrVectorNotFound) {
-			version = v1
-		}
-
-		// update cache
-		page[slot] = version
 	}
+
+	return v.loadInto(ctx, vectorID)
+}
+
+// loadInto fetches the version from the store — without holding any lock, so
+// concurrent readers never queue behind an LSM read — and installs it into
+// memory only if no writer beat us to it. The memory value always wins: it is
+// at least as new as anything the store returned before we took the lock.
+func (v *VersionMap) loadInto(ctx context.Context, vectorID uint64) (VectorVersion, error) {
+	loaded, err := v.store.Get(ctx, vectorID)
+	if err != nil && !errors.Is(err, ErrVectorNotFound) {
+		return 0, errors.Wrapf(err, "failed to get version for vector %d", vectorID)
+	}
+	if errors.Is(err, ErrVectorNotFound) {
+		loaded = v1
+	}
+
+	page, slot := v.data.EnsurePageFor(vectorID)
+	v.locks.Lock(vectorID)
+	if page[slot] == 0 {
+		page[slot] = loaded
+	}
+	version := page[slot]
+	v.locks.Unlock(vectorID)
 
 	return version, nil
 }
 
-// Incr increments the version of the vector and returns the new version.
+// persist writes the current in-memory version of the vector to the store.
+// Persists are serialized per vector, and each re-reads memory after
+// acquiring the persist lock, so the last persist among racing writers lands
+// the newest value. The memory lock is never held across the LSM write.
+func (v *VersionMap) persist(ctx context.Context, vectorID uint64, page []VectorVersion, slot int) error {
+	v.persistLocks.Lock(vectorID)
+	defer v.persistLocks.Unlock(vectorID)
+
+	v.locks.RLock(vectorID)
+	cur := page[slot]
+	v.locks.RUnlock(vectorID)
+
+	return v.store.Set(ctx, vectorID, cur)
+}
+
+// Increment increments the version of the vector and returns the new version.
+// It fails with ErrVersionIncrementFailed if the current version does not
+// match previousVersion or the vector is deleted. On a persist error the
+// memory update has already happened; a retry (Get + Increment) re-persists
+// and heals the store.
 func (v *VersionMap) Increment(ctx context.Context, vectorID uint64, previousVersion VectorVersion) (VectorVersion, error) {
-	var err error
-
-	page, slot := v.data.EnsurePageFor(vectorID)
-	v.locks.Lock(vectorID)
-	defer v.locks.Unlock(vectorID)
-
-	old := page[slot]
-	if old == 0 {
-		// not in cache, check store
-		old, err = v.store.Get(ctx, vectorID)
-		if err != nil && !errors.Is(err, ErrVectorNotFound) {
-			return 0, errors.Wrapf(err, "failed to get version for vector %d", vectorID)
-		}
-		if errors.Is(err, ErrVectorNotFound) {
-			old = v1
-		}
+	// ensure the entry is loaded so the CAS below never touches the store
+	if _, err := v.Get(ctx, vectorID); err != nil {
+		return 0, err
 	}
 
+	page, slot := v.data.GetPageFor(vectorID)
+	v.locks.Lock(vectorID)
+	old := page[slot]
 	if old.Deleted() || old != previousVersion {
+		v.locks.Unlock(vectorID)
 		return old, ErrVersionIncrementFailed
 	}
-
 	newVersion := old.Increment()
-	err = v.store.Set(ctx, vectorID, newVersion)
-	if err != nil {
-		return old, err
-	}
 	page[slot] = newVersion
+	v.locks.Unlock(vectorID)
+
+	if err := v.persist(ctx, vectorID, page, slot); err != nil {
+		return newVersion, err
+	}
 	return newVersion, nil
 }
 
+// MarkDeleted sets the tombstone bit for the vector. It always persists, even
+// when the vector is already deleted in memory, so a retry after a failed
+// persist heals a store that missed the tombstone.
 func (v *VersionMap) MarkDeleted(ctx context.Context, vectorID uint64) (VectorVersion, error) {
-	var err error
+	// ensure the entry is loaded so the update below never touches the store
+	if _, err := v.Get(ctx, vectorID); err != nil {
+		return 0, err
+	}
 
-	page, slot := v.data.EnsurePageFor(vectorID)
+	page, slot := v.data.GetPageFor(vectorID)
 	v.locks.Lock(vectorID)
-	defer v.locks.Unlock(vectorID)
-
 	old := page[slot]
-	if old == 0 {
-		// not in cache, check store
-		old, err = v.store.Get(ctx, vectorID)
-		if err != nil && !errors.Is(err, ErrVectorNotFound) {
-			return 0, errors.Wrapf(err, "failed to get version for vector %d", vectorID)
-		}
-		if errors.Is(err, ErrVectorNotFound) {
-			old = v1
-		}
+	newVersion := old
+	if !old.Deleted() {
+		counter := uint8(old) & counterMask // 0-127
+		newVersion = VectorVersion(tombstoneMask | counter)
+		page[slot] = newVersion
 	}
+	v.locks.Unlock(vectorID)
 
-	if old.Deleted() {
-		return old, nil
+	if err := v.persist(ctx, vectorID, page, slot); err != nil {
+		return newVersion, err
 	}
-
-	counter := uint8(old) & counterMask // 0-127
-	newVersion := VectorVersion(tombstoneMask | counter)
-	err = v.store.Set(ctx, vectorID, newVersion)
-	if err != nil {
-		return old, err
-	}
-	page[slot] = newVersion
 
 	return newVersion, nil
 }
@@ -200,6 +205,51 @@ func (v *VersionMap) IsDeleted(ctx context.Context, vectorID uint64) (bool, erro
 		return false, err
 	}
 	return version.Deleted(), nil
+}
+
+// Warmup loads every persisted vector version into memory with one
+// sequential sweep over the store, so that searches after a restart never
+// fault versions in one LSM read at a time. In-memory values always win
+// over persisted ones, making it safe to run concurrently with reads and
+// writes. It returns the number of entries installed.
+func (v *VersionMap) Warmup(ctx context.Context) (int, error) {
+	var count int
+	v.store.IterateAll(func(vectorID uint64, loaded VectorVersion) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		page, slot := v.data.EnsurePageFor(vectorID)
+		v.locks.Lock(vectorID)
+		if page[slot] == 0 {
+			page[slot] = loaded
+			count++
+		}
+		v.locks.Unlock(vectorID)
+		return true
+	})
+
+	err := ctx.Err()
+	if err != nil {
+		return count, err
+	}
+	return count, nil
+}
+
+// EnsureDefault installs the implicit first version for a vector with no
+// in-memory entry yet, and reports whether it did. Vectors are added at
+// version 1 without persisting it (the store only sees increments and
+// deletes), so entries absent from the store default to v1 on load;
+// installing that default eagerly keeps such vectors off the lazy fault
+// path. In-memory values always win.
+func (v *VersionMap) EnsureDefault(vectorID uint64) bool {
+	page, slot := v.data.EnsurePageFor(vectorID)
+	v.locks.Lock(vectorID)
+	installed := page[slot] == 0
+	if installed {
+		page[slot] = v1
+	}
+	v.locks.Unlock(vectorID)
+	return installed
 }
 
 // VersionStore is a persistent store for vector versions.
@@ -238,4 +288,24 @@ func (v *VersionStore) Get(ctx context.Context, vectorID uint64) (VectorVersion,
 func (v *VersionStore) Set(ctx context.Context, vectorID uint64, version VectorVersion) error {
 	key := v.key(vectorID)
 	return v.bucket.Put(key[:], []byte{byte(version)})
+}
+
+// IterateAll calls fn for every persisted vector version, in one sequential
+// sweep over the store. Iteration stops early when fn returns false.
+func (v *VersionStore) IterateAll(fn func(vectorID uint64, version VectorVersion) bool) {
+	c := v.bucket.CursorReplaceReusable()
+	defer c.Close()
+
+	for k, val := c.Seek(versionMapBucketPrefix); k != nil; k, val = c.Next() {
+		if !bytes.HasPrefix(k, versionMapBucketPrefix) {
+			break // left the version keyspace of the shared bucket
+		}
+		if len(k) != len(versionMapBucketPrefix)+8 || len(val) == 0 {
+			continue
+		}
+		vectorID := binary.LittleEndian.Uint64(k[len(versionMapBucketPrefix):])
+		if !fn(vectorID, VectorVersion(val[0])) {
+			break
+		}
+	}
 }

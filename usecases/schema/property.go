@@ -13,6 +13,7 @@ package schema
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -88,6 +89,9 @@ func (h *Handler) AddClassProperty(ctx context.Context, principal *models.Princi
 			return nil, 0, err
 		}
 	}
+	// Strip RAFT-internal fields unconditionally (including merge-existing
+	// props, which the loop above skips) so a client can never seed them.
+	clearInternalPropertyFields(newProps...)
 
 	if err := h.setNewPropDefaults(class, newProps...); err != nil {
 		return nil, 0, err
@@ -119,7 +123,9 @@ func (h *Handler) AddClassProperty(ctx context.Context, principal *models.Princi
 	return class, version, err
 }
 
-// DeleteClassPropertyIndex deletes collection's property index
+// DeleteClassPropertyIndex deletes collection's property index. Whether the
+// flag is already off is read from this node's own schema, so a follower that
+// has not applied the flip yet answers success having written nothing.
 func (h *Handler) DeleteClassPropertyIndex(ctx context.Context, principal *models.Principal,
 	className, propertyName, indexName string,
 ) error {
@@ -128,7 +134,9 @@ func (h *Handler) DeleteClassPropertyIndex(ctx context.Context, principal *model
 		return err
 	}
 
-	if err := h.Authorizer.Authorize(ctx, principal, authorization.UPDATE, authorization.CollectionsMetadata(className)...); err != nil {
+	// Collections (data+metadata), matching the REST pre-authz and the other
+	// index write verbs: dropping an index rewrites data, not metadata only.
+	if err := h.Authorizer.Authorize(ctx, principal, authorization.UPDATE, authorization.Collections(className)...); err != nil {
 		return err
 	}
 
@@ -204,16 +212,19 @@ func (h *Handler) DeleteClassPropertyIndex(ctx context.Context, principal *model
 			prop.IndexFilterable = &notExists
 			updateFields = []string{command.PropertyFieldIndexFilterable}
 		} else {
-			// nothing to do
+			// nothing to do — no RAFT write
 			return nil
 		}
 	case "searchable":
 		if prop.IndexSearchable != nil && *prop.IndexSearchable {
 			notExists := false
 			prop.IndexSearchable = &notExists
-			updateFields = []string{command.PropertyFieldIndexSearchable}
+			// Clear the blockmax stamp in the same masked write: it must not
+			// outlive its index, or a re-enable resolves stale blockmax truth.
+			prop.SearchableBlockmax = nil
+			updateFields = []string{command.PropertyFieldIndexSearchable, command.PropertyFieldSearchableBlockmax}
 		} else {
-			// nothing to do
+			// nothing to do — no RAFT write
 			return nil
 		}
 	case "rangeFilters":
@@ -222,7 +233,7 @@ func (h *Handler) DeleteClassPropertyIndex(ctx context.Context, principal *model
 			prop.IndexRangeFilters = &notExists
 			updateFields = []string{command.PropertyFieldIndexRangeFilters}
 		} else {
-			// nothing to do
+			// nothing to do — no RAFT write
 			return nil
 		}
 	default:
@@ -249,7 +260,11 @@ func (h *Handler) DeleteClassVectorIndex(ctx context.Context, principal *models.
 		return fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 
-	if err := h.Authorizer.Authorize(ctx, principal, authorization.UPDATE, authorization.CollectionsMetadata(className)...); err != nil {
+	// Collections (data+metadata), matching DeleteClassPropertyIndex: dropping
+	// a vector index irreversibly rewrites every object in the collection
+	// (vectors stripped cluster-wide), not metadata only — a metadata-only
+	// principal must not be able to trigger it.
+	if err := h.Authorizer.Authorize(ctx, principal, authorization.UPDATE, authorization.Collections(className)...); err != nil {
 		return err
 	}
 
@@ -296,6 +311,13 @@ func (h *Handler) DeleteClassVectorIndex(ctx context.Context, principal *models.
 	}
 
 	if _, err = h.schemaManager.UpdateClass(ctx, class, nil); err != nil {
+		// The FSM's retryable refusals (e.g. the previous drop of this name is
+		// still completing) arrive wrapped in the cluster-layer bad-request
+		// sentinel; translate to the domain sentinel so the REST handler
+		// answers 422, not 500.
+		if errors.Is(err, clusterSchema.ErrBadRequest) {
+			return fmt.Errorf("%w: %w", ErrValidation, err)
+		}
 		return err
 	}
 

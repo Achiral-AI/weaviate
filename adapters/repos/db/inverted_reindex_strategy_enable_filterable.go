@@ -82,26 +82,17 @@ func (s *EnableFilterableStrategy) WriteToReindexBucket(shard ShardLike, bucket 
 	return nil
 }
 
-// ShouldProcessProperty always returns true. Scope is driven by the
-// reindexTaskConfig.selectedPropsByCollection set in the task constructor,
-// not by the schema flag — during this migration IndexFilterable is still
-// false on every targeted property.
-func (s *EnableFilterableStrategy) ShouldProcessProperty(property *inverted.Property) bool {
-	return true
-}
-
 func (s *EnableFilterableStrategy) MakeAddCallback(bucketNamer func(string) string,
 	propsByName map[string]struct{}, forTargetStrategy bool,
 ) onAddToPropertyValueIndex {
 	return func(shard *Shard, docID uint64, property *inverted.Property) error {
 		// Don't gate on HasFilterableIndex — it's false on the target
 		// property until OnMigrationComplete flips it.
-		if _, ok := propsByName[property.Name]; !ok {
+		bucket, bucketName, skip := resolveScopedDoubleWriteBucket(shard, property,
+			propsByName, bucketNamer, s.SourceBucketName, forTargetStrategy)
+		if skip {
 			return nil
 		}
-
-		bucketName := bucketNamer(property.Name)
-		bucket := shard.store.Bucket(bucketName)
 		for _, item := range property.Items {
 			if err := shard.addToPropertySetBucket(bucket, docID, item.Data); err != nil {
 				return fmt.Errorf("adding prop '%s' to bucket '%s': %w", item.Data, bucketName, err)
@@ -115,12 +106,11 @@ func (s *EnableFilterableStrategy) MakeDeleteCallback(bucketNamer func(string) s
 	propsByName map[string]struct{}, forTargetStrategy bool,
 ) onDeleteFromPropertyValueIndex {
 	return func(shard *Shard, docID uint64, property *inverted.Property) error {
-		if _, ok := propsByName[property.Name]; !ok {
+		bucket, bucketName, skip := resolveScopedDoubleWriteBucket(shard, property,
+			propsByName, bucketNamer, s.SourceBucketName, forTargetStrategy)
+		if skip {
 			return nil
 		}
-
-		bucketName := bucketNamer(property.Name)
-		bucket := shard.store.Bucket(bucketName)
 		for _, item := range property.Items {
 			if err := shard.deleteFromPropertySetBucket(bucket, docID, item.Data); err != nil {
 				return fmt.Errorf("deleting prop '%s' from bucket '%s': %w", item.Data, bucketName, err)

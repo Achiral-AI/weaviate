@@ -25,6 +25,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vmihailenco/msgpack/v5"
+
 	"github.com/weaviate/weaviate/entities/additional"
 	errwrap "github.com/weaviate/weaviate/entities/errors"
 	"github.com/weaviate/weaviate/entities/models"
@@ -211,6 +212,10 @@ func FromBinaryOptionalDisk(data []byte, className string,
 func fromBinaryOptionalInternal(data []byte, className string,
 	addProp additional.Properties, properties *PropertyExtraction,
 ) (*Object, error) {
+	if len(data) == 0 {
+		return nil, errors.New("cannot decode an empty object")
+	}
+
 	ko := &Object{}
 
 	rw := byteops.NewReadWriter(data)
@@ -218,6 +223,13 @@ func fromBinaryOptionalInternal(data []byte, className string,
 	if ko.MarshallerVersion != 1 {
 		return nil, errors.Errorf("unsupported binary marshaller version %d", ko.MarshallerVersion)
 	}
+
+	// only the fixed-width header may be read unchecked; every length past it
+	// comes from the data itself
+	if len(data) < marshallerV1HeaderLen {
+		return nil, errors.Errorf("object of %d bytes is too short to hold a header", len(data))
+	}
+
 	ko.DocID = rw.ReadUint64()
 	rw.MoveBufferPositionForward(1) // ignore kind-byte
 	uuidObj, err := uuid.FromBytes(rw.ReadBytesFromBuffer(16))
@@ -228,14 +240,25 @@ func fromBinaryOptionalInternal(data []byte, className string,
 
 	createTime := int64(rw.ReadUint64())
 	updateTime := int64(rw.ReadUint64())
-	vectorLength := rw.ReadUint16()
+
+	vectorLength, err := rw.ReadUint16Checked()
+	if err != nil {
+		return nil, fmt.Errorf("read vector length: %w", err)
+	}
 	// The vector length should always be returned (for usage metrics purposes) even if the vector itself is skipped
 	ko.VectorLen = int(vectorLength)
+	vectorByteLen := uint64(vectorLength) * byteops.Uint32Len
 	if addProp.Vector {
+		vectorBytes, err := rw.ReadBytesFromBufferChecked(vectorByteLen)
+		if err != nil {
+			return nil, fmt.Errorf("read vector: %w", err)
+		}
 		ko.Object.Vector = make([]float32, vectorLength)
-		byteops.CopyBytesToSlice(ko.Object.Vector, rw.ReadBytesFromBuffer(uint64(vectorLength)*byteops.Uint32Len))
+		byteops.CopyBytesToSlice(ko.Object.Vector, vectorBytes)
 	} else {
-		rw.MoveBufferPositionForward(uint64(vectorLength) * 4)
+		if err := rw.SkipChecked(vectorByteLen); err != nil {
+			return nil, fmt.Errorf("skip vector: %w", err)
+		}
 		ko.Object.Vector = nil
 	}
 	ko.Vector = ko.Object.Vector
@@ -245,34 +268,57 @@ func fromBinaryOptionalInternal(data []byte, className string,
 	// falls back to the on-disk value. If both are empty there is no class
 	// to attach to the decoded object — return an error rather than produce
 	// a silent empty Class.
-	classNameLength := uint64(rw.ReadUint16())
+	classNameLength, err := rw.ReadUint16Checked()
+	if err != nil {
+		return nil, fmt.Errorf("read class name length: %w", err)
+	}
 	if className == "" {
 		if classNameLength == 0 {
 			return nil, errors.New("storobj: cannot decode object with empty className: caller supplied no className and on-disk class-name field is empty")
 		}
-		className = string(rw.ReadBytesFromBuffer(classNameLength))
-	} else {
-		rw.MoveBufferPositionForward(classNameLength)
+		classNameBytes, err := rw.ReadBytesFromBufferChecked(uint64(classNameLength))
+		if err != nil {
+			return nil, fmt.Errorf("read class name: %w", err)
+		}
+		className = string(classNameBytes)
+	} else if err := rw.SkipChecked(uint64(classNameLength)); err != nil {
+		return nil, fmt.Errorf("skip class name: %w", err)
 	}
 
-	propLength := rw.ReadUint32()
+	propLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return nil, fmt.Errorf("read properties length: %w", err)
+	}
 	var props []byte
 	if addProp.NoProps {
-		rw.MoveBufferPositionForward(uint64(propLength))
-	} else {
-		props = rw.ReadBytesFromBuffer(uint64(propLength))
+		if err := rw.SkipChecked(uint64(propLength)); err != nil {
+			return nil, fmt.Errorf("skip properties: %w", err)
+		}
+	} else if props, err = rw.ReadBytesFromBufferChecked(uint64(propLength)); err != nil {
+		return nil, fmt.Errorf("read properties: %w", err)
 	}
 
+	metaLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return nil, fmt.Errorf("read meta length: %w", err)
+	}
 	var meta []byte
-	metaLength := rw.ReadUint32()
 	if addProp.Classification || len(addProp.ModuleParams) > 0 {
-		meta = rw.ReadBytesFromBuffer(uint64(metaLength))
-	} else {
-		rw.MoveBufferPositionForward(uint64(metaLength))
+		if meta, err = rw.ReadBytesFromBufferChecked(uint64(metaLength)); err != nil {
+			return nil, fmt.Errorf("read meta: %w", err)
+		}
+	} else if err := rw.SkipChecked(uint64(metaLength)); err != nil {
+		return nil, fmt.Errorf("skip meta: %w", err)
 	}
 
-	vectorWeightsLength := rw.ReadUint32()
-	vectorWeights := rw.ReadBytesFromBuffer(uint64(vectorWeightsLength))
+	vectorWeightsLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return nil, fmt.Errorf("read vector weights length: %w", err)
+	}
+	vectorWeights, err := rw.ReadBytesFromBufferChecked(uint64(vectorWeightsLength))
+	if err != nil {
+		return nil, fmt.Errorf("read vector weights: %w", err)
+	}
 
 	if len(addProp.Vectors) > 0 {
 		vectors, err := unmarshalTargetVectors(&rw)
@@ -289,13 +335,8 @@ func fromBinaryOptionalInternal(data []byte, className string,
 				ko.Object.Vectors[vecName] = vec
 			}
 		}
-	} else {
-		if rw.Position < uint64(len(rw.Buffer)) {
-			_ = rw.ReadBytesFromBufferWithUint32LengthIndicator()
-			targetVectorsSegmentLength := rw.ReadUint32()
-			pos := rw.Position
-			rw.MoveBufferToAbsolutePosition(pos + uint64(targetVectorsSegmentLength))
-		}
+	} else if err := skipVectorSegment(&rw, "target vectors"); err != nil {
+		return nil, err
 	}
 
 	if rw.Position < uint64(len(rw.Buffer)) && len(addProp.Vectors) > 0 {
@@ -824,7 +865,7 @@ func SearchResults(in []*Object, additional additional.Properties, tenant string
 	out := make(search.Results, len(in))
 
 	for i, elem := range in {
-		out[i] = *(elem.SearchResult(additional, tenant))
+		out[i] = *elem.SearchResult(additional, tenant)
 	}
 
 	return out
@@ -930,6 +971,10 @@ const (
 	marshallerV1UpdateTimeOffset = 1 + 8 + 1 + 16 + 8     // 34
 )
 
+// MarshallerV1HeaderLen bounds the value prefix a digest-only scan must retain:
+// DocIDAndTimeFromBinary reads no further than this.
+const MarshallerV1HeaderLen = marshallerV1HeaderLen
+
 const (
 	maxVectorLength               int = math.MaxUint16
 	maxClassNameLength            int = math.MaxUint16
@@ -957,77 +1002,139 @@ func (ko *Object) MarshalBinaryOptional(addProps additional.Properties) ([]byte,
 }
 
 func (ko *Object) marshalBinaryInternal(addProps additional.Properties, skipClassName bool) ([]byte, error) {
-	if ko.MarshallerVersion != 1 {
-		return nil, errors.Errorf("unsupported marshaller version %d", ko.MarshallerVersion)
+	pm, err := ko.prepareMarshal(addProps, skipClassName)
+	if err != nil {
+		return nil, err
 	}
 
-	kindByte := uint8(0)
+	byteBuffer := make([]byte, pm.Len())
+	if err := pm.MarshalTo(byteBuffer); err != nil {
+		return byteBuffer, err
+	}
+	return byteBuffer, nil
+}
+
+// emptySchemaJSON keeps older nodes' pre-upgrade unmarshal path (which lacks
+// an empty-schema check) from breaking. Shared across objects; read-only.
+var emptySchemaJSON = []byte("{}")
+
+// PreparedMarshal is the sizing-pass output of the two-pass binary marshal
+// (see PrepareMarshalOptional, MarshalTo), letting callers that batch many
+// objects into one payload allocate a single exactly-sized buffer instead of
+// one per object.
+//
+// It aliases rather than copies the source Object's vector slices, so
+// concurrent mutation of vector contents is as unsafe as for MarshalBinary;
+// otherwise it is self-contained once the source Object is discarded.
+type PreparedMarshal struct {
+	version      uint8
+	docID        uint64
+	kind         uint8
+	id           uuid.UUID
+	creationTime uint64
+	updateTime   uint64
+
+	vector []float32 // nil when the vector is excluded
+
+	className     string // empty when skipped (on-disk format without class name)
+	schema        []byte
+	meta          []byte
+	vectorWeights []byte
+
+	targetVectorsOffsets       []byte
+	targetVectorsSegmentLength uint32
+	targetVectors              [][]float32 // in targetVectorsOffsets order
+
+	multiVectorsOffsets       []byte
+	multiVectorsSegmentLength uint32
+	multiVectors              [][][]float32 // in multiVectorsOffsets order
+
+	size int
+}
+
+// Len returns the exact number of bytes MarshalTo will write.
+func (pm *PreparedMarshal) Len() int {
+	return pm.size
+}
+
+// PrepareMarshalOptional runs the sizing pass of the two-pass marshal with
+// the same addProps filtering as MarshalBinaryOptional; MarshalTo produces
+// identical bytes.
+func (ko *Object) PrepareMarshalOptional(addProps additional.Properties) (PreparedMarshal, error) {
+	return ko.prepareMarshal(addProps, false)
+}
+
+// prepareMarshal is the sizing pass shared by marshalBinaryInternal and
+// PrepareMarshalOptional; filtering semantics (addProps, skipClassName)
+// match marshalBinaryInternal.
+func (ko *Object) prepareMarshal(addProps additional.Properties, skipClassName bool) (PreparedMarshal, error) {
+	var pm PreparedMarshal
+
+	if ko.MarshallerVersion != 1 {
+		return pm, errors.Errorf("unsupported marshaller version %d", ko.MarshallerVersion)
+	}
+
+	pm.version = ko.MarshallerVersion
+	pm.docID = ko.DocID
 	// Deprecated Kind field
-	kindByte = 1
+	pm.kind = 1
+	pm.creationTime = uint64(ko.CreationTimeUnix())
+	pm.updateTime = uint64(ko.LastUpdateTimeUnix())
 
 	idParsed, err := uuid.Parse(ko.ID().String())
 	if err != nil {
-		return nil, err
+		return pm, err
 	}
-	idBytes, err := idParsed.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
+	pm.id = idParsed
 
 	// Conditionally include vector based on addProps.Vector
 	var vectorLength uint32
 	if addProps.Vector {
 		if len(ko.Vector) > maxVectorLength {
-			return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vector", len(ko.Vector), maxVectorLength)
+			return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vector", len(ko.Vector), maxVectorLength)
 		}
 		vectorLength = uint32(len(ko.Vector))
+		pm.vector = ko.Vector
 	}
 
-	className := []byte(ko.Class())
+	className := string(ko.Class())
 	if len(className) > maxClassNameLength {
-		return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "className", len(className), maxClassNameLength)
+		return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "className", len(className), maxClassNameLength)
 	}
-	classNameLength := uint32(len(className))
-	if skipClassName {
-		classNameLength = 0
+	if !skipClassName {
+		pm.className = className
 	}
 
 	// Conditionally include properties based on addProps.NoProps
-	var schema []byte
-	var schemaLength uint32
 	if !addProps.NoProps {
-		schema, err = json.Marshal(ko.Properties())
+		pm.schema, err = json.Marshal(ko.Properties())
 		if err != nil {
-			return nil, err
+			return pm, err
 		}
-		if len(schema) > maxSchemaLength {
-			return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "schema", len(schema), maxSchemaLength)
+		if len(pm.schema) > maxSchemaLength {
+			return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "schema", len(pm.schema), maxSchemaLength)
 		}
-		schemaLength = uint32(len(schema))
 	} else {
 		// send empty object so that we don't break unmarshalling during upgrades
 		// where some nodes don't have the empty check on the unmarshal side yet
-		schema = []byte("{}")
-		schemaLength = uint32(len(schema))
+		pm.schema = emptySchemaJSON
 	}
 
-	meta, err := json.Marshal(ko.AdditionalProperties())
+	pm.meta, err = json.Marshal(ko.AdditionalProperties())
 	if err != nil {
-		return nil, err
+		return pm, err
 	}
-	if len(meta) > maxMetaLength {
-		return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "meta", len(meta), maxMetaLength)
+	if len(pm.meta) > maxMetaLength {
+		return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "meta", len(pm.meta), maxMetaLength)
 	}
-	metaLength := uint32(len(meta))
 
-	vectorWeights, err := json.Marshal(ko.VectorWeights())
+	pm.vectorWeights, err = json.Marshal(ko.VectorWeights())
 	if err != nil {
-		return nil, err
+		return pm, err
 	}
-	if len(vectorWeights) > maxVectorWeightsLength {
-		return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vectorWeights", len(vectorWeights), maxVectorWeightsLength)
+	if len(pm.vectorWeights) > maxVectorWeightsLength {
+		return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vectorWeights", len(pm.vectorWeights), maxVectorWeightsLength)
 	}
-	vectorWeightsLength := uint32(len(vectorWeights))
 
 	// Determine which target vectors to include:
 	// - IncludeAllTargetVectors: true means include ALL vectors (used by MarshalBinary)
@@ -1045,13 +1152,10 @@ func (ko *Object) marshalBinaryInternal(addProps additional.Properties, skipClas
 		}
 	}
 
-	var targetVectorsOffsets []byte
-	var targetVectorsOffsetsLength uint32
 	var targetVectorsSegmentLength int
-
-	targetVectorsOffsetOrder := make([]string, 0, len(ko.Vectors))
 	if (includeAllTargetVectors || includeSpecificTargetVectors) && len(ko.Vectors) > 0 {
 		offsetsMap := map[string]uint32{}
+		pm.targetVectors = make([][]float32, 0, len(ko.Vectors))
 		for name, vec := range ko.Vectors {
 			// Skip if we're filtering and this vector wasn't requested
 			if includeSpecificTargetVectors {
@@ -1060,40 +1164,37 @@ func (ko *Object) marshalBinaryInternal(addProps additional.Properties, skipClas
 				}
 			}
 			if len(vec) > maxVectorLength {
-				return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vector", len(vec), maxVectorLength)
+				return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vector", len(vec), maxVectorLength)
 			}
 
 			offsetsMap[name] = uint32(targetVectorsSegmentLength)
 			targetVectorsSegmentLength += 2 + 4*len(vec) // 2 for vec length + vec bytes
 
 			if targetVectorsSegmentLength > maxTargetVectorsSegmentLength {
-				return nil,
+				return pm,
 					fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)",
 						"targetVectorsSegmentLength", targetVectorsSegmentLength, maxTargetVectorsSegmentLength)
 			}
 
-			targetVectorsOffsetOrder = append(targetVectorsOffsetOrder, name)
+			pm.targetVectors = append(pm.targetVectors, vec)
 		}
 
 		if len(offsetsMap) > 0 {
-			targetVectorsOffsets, err = msgpack.Marshal(offsetsMap)
+			pm.targetVectorsOffsets, err = msgpack.Marshal(offsetsMap)
 			if err != nil {
-				return nil, fmt.Errorf("could not marshal target vectors offsets: %w", err)
+				return pm, fmt.Errorf("could not marshal target vectors offsets: %w", err)
 			}
-			if len(targetVectorsOffsets) > maxTargetVectorsOffsetsLength {
-				return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "targetVectorsOffsets", len(targetVectorsOffsets), maxTargetVectorsOffsetsLength)
+			if len(pm.targetVectorsOffsets) > maxTargetVectorsOffsetsLength {
+				return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "targetVectorsOffsets", len(pm.targetVectorsOffsets), maxTargetVectorsOffsetsLength)
 			}
-			targetVectorsOffsetsLength = uint32(len(targetVectorsOffsets))
 		}
 	}
+	pm.targetVectorsSegmentLength = uint32(targetVectorsSegmentLength)
 
-	var multiVectorsOffsets []byte
-	var multiVectorsOffsetsLength uint32
 	var multiVectorsSegmentLength int
-
-	multiVectorsOffsetOrder := make([]string, 0, len(ko.MultiVectors))
 	if (includeAllTargetVectors || includeSpecificTargetVectors) && len(ko.MultiVectors) > 0 {
 		offsetsMap := map[string]uint32{}
+		pm.multiVectors = make([][][]float32, 0, len(ko.MultiVectors))
 		for name, vecs := range ko.MultiVectors {
 			// Skip if we're filtering and this vector wasn't requested
 			if includeSpecificTargetVectors {
@@ -1106,99 +1207,106 @@ func (ko *Object) marshalBinaryInternal(addProps additional.Properties, skipClas
 			multiVectorsSegmentLength += 4
 			for _, vec := range vecs {
 				if len(vec) > maxVectorLength {
-					return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vector", len(vec), maxVectorLength)
+					return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "vector", len(vec), maxVectorLength)
 				}
 				// 2 bytes for vec length and 4 bytes per float32
 				multiVectorsSegmentLength += 2 + 4*len(vec)
 
 				if multiVectorsSegmentLength > maxMultiVectorsSegmentLength {
-					return nil,
+					return pm,
 						fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)",
 							"multiVectorsSegmentLength", multiVectorsSegmentLength, maxMultiVectorsSegmentLength)
 				}
 			}
-			multiVectorsOffsetOrder = append(multiVectorsOffsetOrder, name)
+			pm.multiVectors = append(pm.multiVectors, vecs)
 		}
 
 		if len(offsetsMap) > 0 {
-			multiVectorsOffsets, err = msgpack.Marshal(offsetsMap)
+			pm.multiVectorsOffsets, err = msgpack.Marshal(offsetsMap)
 			if err != nil {
-				return nil, fmt.Errorf("could not marshal multi vectors offsets: %w", err)
+				return pm, fmt.Errorf("could not marshal multi vectors offsets: %w", err)
 			}
-			if len(multiVectorsOffsets) > maxMultiVectorsOffsetsLength {
-				return nil, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "multiVectorsOffsets", len(multiVectorsOffsets), maxMultiVectorsOffsetsLength)
+			if len(pm.multiVectorsOffsets) > maxMultiVectorsOffsetsLength {
+				return pm, fmt.Errorf("could not marshal '%s' max length exceeded (%d/%d)", "multiVectorsOffsets", len(pm.multiVectorsOffsets), maxMultiVectorsOffsetsLength)
 			}
-			multiVectorsOffsetsLength = uint32(len(multiVectorsOffsets))
 		}
 	}
+	pm.multiVectorsSegmentLength = uint32(multiVectorsSegmentLength)
 
 	totalBufferLength := 1 + 8 + 1 + 16 + 8 + 8 +
 		2 + vectorLength*4 +
-		2 + classNameLength +
-		4 + schemaLength +
-		4 + metaLength +
-		4 + vectorWeightsLength +
-		4 + targetVectorsOffsetsLength +
-		4 + uint32(targetVectorsSegmentLength) +
-		4 + multiVectorsOffsetsLength +
-		4 + uint32(multiVectorsSegmentLength)
+		2 + uint32(len(pm.className)) +
+		4 + uint32(len(pm.schema)) +
+		4 + uint32(len(pm.meta)) +
+		4 + uint32(len(pm.vectorWeights)) +
+		4 + uint32(len(pm.targetVectorsOffsets)) +
+		4 + pm.targetVectorsSegmentLength +
+		4 + uint32(len(pm.multiVectorsOffsets)) +
+		4 + pm.multiVectorsSegmentLength
+	pm.size = int(totalBufferLength)
 
-	byteBuffer := make([]byte, totalBufferLength)
-	rw := byteops.NewReadWriter(byteBuffer)
-	rw.WriteByte(ko.MarshallerVersion)
-	rw.WriteUint64(ko.DocID)
-	rw.WriteByte(kindByte)
+	return pm, nil
+}
 
-	rw.CopyBytesToBuffer(idBytes)
+// MarshalTo writes the serialized object into buf, which must be exactly
+// Len() bytes long, producing the same bytes as MarshalBinaryOptional for
+// the addProps the PreparedMarshal was prepared with.
+func (pm *PreparedMarshal) MarshalTo(buf []byte) error {
+	if len(buf) != pm.size {
+		return errors.Errorf("prepared marshal requires a buffer of exactly %d bytes, got %d", pm.size, len(buf))
+	}
 
-	rw.WriteUint64(uint64(ko.CreationTimeUnix()))
-	rw.WriteUint64(uint64(ko.LastUpdateTimeUnix()))
+	rw := byteops.NewReadWriter(buf)
+	rw.WriteByte(pm.version)
+	rw.WriteUint64(pm.docID)
+	rw.WriteByte(pm.kind)
+
+	rw.CopyBytesToBuffer(pm.id[:])
+
+	rw.WriteUint64(pm.creationTime)
+	rw.WriteUint64(pm.updateTime)
+
+	vectorLength := len(pm.vector)
 	rw.WriteUint16(uint16(vectorLength))
-
-	if addProps.Vector {
-		byteops.CopySliceToBytes(rw.Buffer[rw.Position:rw.Position+uint64(vectorLength)*byteops.Uint32Len], ko.Vector)
+	if vectorLength > 0 {
+		byteops.CopySliceToBytes(rw.Buffer[rw.Position:rw.Position+uint64(vectorLength)*byteops.Uint32Len], pm.vector)
 		rw.MoveBufferPositionForward(uint64(vectorLength) * byteops.Uint32Len)
 	}
 
-	rw.WriteUint16(uint16(classNameLength))
-	if classNameLength > 0 {
-		err = rw.CopyBytesToBuffer(className)
-		if err != nil {
-			return byteBuffer, errors.Wrap(err, "Could not copy className")
+	rw.WriteUint16(uint16(len(pm.className)))
+	if len(pm.className) > 0 {
+		// copy the string directly instead of going through a []byte
+		// conversion, which would allocate
+		copy(rw.Buffer[rw.Position:rw.Position+uint64(len(pm.className))], pm.className)
+		rw.MoveBufferPositionForward(uint64(len(pm.className)))
+	}
+
+	rw.WriteUint32(uint32(len(pm.schema)))
+	if len(pm.schema) > 0 {
+		if err := rw.CopyBytesToBuffer(pm.schema); err != nil {
+			return errors.Wrap(err, "Could not copy schema")
 		}
 	}
 
-	rw.WriteUint32(schemaLength)
-	if schemaLength > 0 {
-		err = rw.CopyBytesToBuffer(schema)
-		if err != nil {
-			return byteBuffer, errors.Wrap(err, "Could not copy schema")
+	rw.WriteUint32(uint32(len(pm.meta)))
+	if err := rw.CopyBytesToBuffer(pm.meta); err != nil {
+		return errors.Wrap(err, "Could not copy meta")
+	}
+
+	rw.WriteUint32(uint32(len(pm.vectorWeights)))
+	if err := rw.CopyBytesToBuffer(pm.vectorWeights); err != nil {
+		return errors.Wrap(err, "Could not copy vectorWeights")
+	}
+
+	rw.WriteUint32(uint32(len(pm.targetVectorsOffsets)))
+	if len(pm.targetVectorsOffsets) > 0 {
+		if err := rw.CopyBytesToBuffer(pm.targetVectorsOffsets); err != nil {
+			return errors.Wrap(err, "Could not copy targetVectorsOffsets")
 		}
 	}
 
-	rw.WriteUint32(metaLength)
-	err = rw.CopyBytesToBuffer(meta)
-	if err != nil {
-		return byteBuffer, errors.Wrap(err, "Could not copy meta")
-	}
-
-	rw.WriteUint32(vectorWeightsLength)
-	err = rw.CopyBytesToBuffer(vectorWeights)
-	if err != nil {
-		return byteBuffer, errors.Wrap(err, "Could not copy vectorWeights")
-	}
-
-	rw.WriteUint32(targetVectorsOffsetsLength)
-	if targetVectorsOffsetsLength > 0 {
-		err = rw.CopyBytesToBuffer(targetVectorsOffsets)
-		if err != nil {
-			return byteBuffer, errors.Wrap(err, "Could not copy targetVectorsOffsets")
-		}
-	}
-
-	rw.WriteUint32(uint32(targetVectorsSegmentLength))
-	for _, name := range targetVectorsOffsetOrder {
-		vec := ko.Vectors[name]
+	rw.WriteUint32(pm.targetVectorsSegmentLength)
+	for _, vec := range pm.targetVectors {
 		vecLen := len(vec)
 
 		rw.WriteUint16(uint16(vecLen))
@@ -1206,17 +1314,15 @@ func (ko *Object) marshalBinaryInternal(addProps additional.Properties, skipClas
 		rw.MoveBufferPositionForward(uint64(vecLen) * byteops.Uint32Len)
 	}
 
-	rw.WriteUint32(multiVectorsOffsetsLength)
-	if multiVectorsOffsetsLength > 0 {
-		err = rw.CopyBytesToBuffer(multiVectorsOffsets)
-		if err != nil {
-			return byteBuffer, errors.Wrap(err, "Could not copy multiVectorsOffsets")
+	rw.WriteUint32(uint32(len(pm.multiVectorsOffsets)))
+	if len(pm.multiVectorsOffsets) > 0 {
+		if err := rw.CopyBytesToBuffer(pm.multiVectorsOffsets); err != nil {
+			return errors.Wrap(err, "Could not copy multiVectorsOffsets")
 		}
 	}
 
-	rw.WriteUint32(uint32(multiVectorsSegmentLength))
-	for _, name := range multiVectorsOffsetOrder {
-		vecs := ko.MultiVectors[name]
+	rw.WriteUint32(pm.multiVectorsSegmentLength)
+	for _, vecs := range pm.multiVectors {
 		rw.WriteUint32(uint32(len(vecs)))
 		for _, vec := range vecs {
 			vecLen := len(vec)
@@ -1226,7 +1332,7 @@ func (ko *Object) marshalBinaryInternal(addProps additional.Properties, skipClas
 		}
 	}
 
-	return byteBuffer, nil
+	return nil
 }
 
 func (ko *Object) MarshalBinary() ([]byte, error) {
@@ -1277,6 +1383,12 @@ func UnmarshalPropertiesFromObject(data []byte, resultProperties map[string]inte
 func UnmarshalProperties(data []byte, properties map[string]interface{}, propertyPaths [][]string) error {
 	var returnError error
 	jsonparser.EachKey(data, func(idx int, value []byte, dataType jsonparser.ValueType, err error) {
+		if idx < 0 {
+			// data the parser cannot walk at all: it reports that without a path
+			returnError = fmt.Errorf("malformed property json: %w", err)
+			return
+		}
+
 		propertyName := propertyPaths[idx][len(propertyPaths[idx])-1]
 
 		switch dataType {
@@ -1409,53 +1521,94 @@ func (ko *Object) UnmarshalBinaryDiskWithProps(data []byte, className string, pr
 // UnmarshalBinaryNetwork. A non-empty className stamps Object.Class; an empty
 // className falls back to the on-disk value.
 func (ko *Object) unmarshalInternal(data []byte, className string, properties *PropertyExtraction) error {
+	if len(data) == 0 {
+		return errors.New("cannot decode an empty object")
+	}
+
 	version := data[0]
 	if version != 1 {
 		return errors.Errorf("unsupported binary marshaller version %d", version)
 	}
 	ko.MarshallerVersion = version
 
+	// only the fixed-width header may be read unchecked; every length past it
+	// comes from the data itself
+	if len(data) < marshallerV1HeaderLen {
+		return errors.Errorf("object of %d bytes is too short to hold a header", len(data))
+	}
+
 	rw := byteops.NewReadWriterWithPosition(data, 1)
 	ko.DocID = rw.ReadUint64()
 	rw.MoveBufferPositionForward(1) // kind-byte
 
-	uuidParsed, err := uuid.FromBytes(data[rw.Position : rw.Position+16])
+	uuidParsed, err := uuid.FromBytes(rw.ReadBytesFromBuffer(16))
 	if err != nil {
 		return err
 	}
-	rw.MoveBufferPositionForward(16)
 
 	createTime := int64(rw.ReadUint64())
 	updateTime := int64(rw.ReadUint64())
 
-	vectorLength := rw.ReadUint16()
+	vectorLength, err := rw.ReadUint16Checked()
+	if err != nil {
+		return errors.Wrap(err, "read vector length")
+	}
+	vectorBytes, err := rw.ReadBytesFromBufferChecked(uint64(vectorLength) * byteops.Uint32Len)
+	if err != nil {
+		return errors.Wrap(err, "read vector")
+	}
 	ko.VectorLen = int(vectorLength)
 	ko.Vector = make([]float32, vectorLength)
-	byteops.CopyBytesToSlice(ko.Vector, rw.ReadBytesFromBuffer(uint64(vectorLength)*byteops.Uint32Len))
+	byteops.CopyBytesToSlice(ko.Vector, vectorBytes)
 
 	// className precedence: a non-empty caller-supplied className wins and
 	// the on-disk class-name bytes are skipped. An empty caller className
 	// falls back to the on-disk value (the UnmarshalBinaryNetwork path). If
 	// both are empty there is no class to attach to the decoded object —
 	// return an error rather than produce a silent empty Class.
-	classNameLength := uint64(rw.ReadUint16())
+	classNameLength, err := rw.ReadUint16Checked()
+	if err != nil {
+		return errors.Wrap(err, "read class name length")
+	}
 	if className == "" {
 		if classNameLength == 0 {
 			return errors.New("storobj: cannot decode object with empty className: caller supplied no className and on-disk class-name field is empty")
 		}
-		className = string(rw.ReadBytesFromBuffer(classNameLength))
-	} else {
-		rw.MoveBufferPositionForward(classNameLength)
+		classNameBytes, err := rw.ReadBytesFromBufferChecked(uint64(classNameLength))
+		if err != nil {
+			return errors.Wrap(err, "read class name")
+		}
+		className = string(classNameBytes)
+	} else if err := rw.SkipChecked(uint64(classNameLength)); err != nil {
+		return errors.Wrap(err, "skip class name")
 	}
 
-	schemaLength := uint64(rw.ReadUint32())
-	schema := rw.ReadBytesFromBuffer(schemaLength)
+	schemaLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return errors.Wrap(err, "read schema length")
+	}
+	schema, err := rw.ReadBytesFromBufferChecked(uint64(schemaLength))
+	if err != nil {
+		return errors.Wrap(err, "read schema")
+	}
 
-	metaLength := uint64(rw.ReadUint32())
-	meta := rw.ReadBytesFromBuffer(metaLength)
+	metaLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return errors.Wrap(err, "read meta length")
+	}
+	meta, err := rw.ReadBytesFromBufferChecked(uint64(metaLength))
+	if err != nil {
+		return errors.Wrap(err, "read meta")
+	}
 
-	vectorWeightsLength := uint64(rw.ReadUint32())
-	vectorWeights := rw.ReadBytesFromBuffer(vectorWeightsLength)
+	vectorWeightsLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return errors.Wrap(err, "read vector weights length")
+	}
+	vectorWeights, err := rw.ReadBytesFromBufferChecked(uint64(vectorWeightsLength))
+	if err != nil {
+		return errors.Wrap(err, "read vector weights")
+	}
 
 	vectors, err := unmarshalTargetVectors(&rw)
 	if err != nil {
@@ -1480,77 +1633,178 @@ func (ko *Object) unmarshalInternal(data []byte, className string, properties *P
 	)
 }
 
-func unmarshalTargetVectors(rw *byteops.ReadWriter) (map[string][]float32, error) {
-	// This check prevents from panic when somebody is upgrading from version that
-	// didn't have multiple target vector support. This check is needed bc with named vectors
-	// feature storage object can have vectors data appended at the end of the file
-	if rw.Position < uint64(len(rw.Buffer)) {
-		targetVectorsOffsets := rw.ReadBytesFromBufferWithUint32LengthIndicator()
-		targetVectorsSegmentLength := rw.ReadUint32()
-		pos := rw.Position
+// vectorSegment is the framing shared by the target-vector and multi-vector
+// sections: a msgpack name->offset map, then a run of vectors whose declared
+// length delimits the section. Offsets are relative to start.
+//
+// Reads are bounded by end, not by the buffer. It is the tighter limit, and the
+// only one that tells a corrupt offset apart from a vector that legitimately
+// runs to the end of the value.
+type vectorSegment struct {
+	offsetsBlob []byte
+	start, end  uint64
+}
 
-		if len(targetVectorsOffsets) > 0 {
-			var tvOffsets map[string]uint32
-			if err := msgpack.Unmarshal(targetVectorsOffsets, &tvOffsets); err != nil {
-				return nil, fmt.Errorf("could not unmarshal target vectors offset: %w", err)
-			}
-
-			targetVectors := map[string][]float32{}
-			for name, offset := range tvOffsets {
-				rw.MoveBufferToAbsolutePosition(pos + uint64(offset))
-				vecLen := rw.ReadUint16()
-				vec := make([]float32, vecLen)
-				byteops.CopyBytesToSlice(vec, rw.ReadBytesFromBuffer(uint64(vecLen)*byteops.Uint32Len))
-				targetVectors[name] = vec
-			}
-
-			rw.MoveBufferToAbsolutePosition(pos + uint64(targetVectorsSegmentLength))
-			return targetVectors, nil
-		}
+// readVectorSegment leaves the cursor at start. present is false when there is
+// nothing to decode — the value ends before the section, as it does for objects
+// written before this vector kind existed, or the section declares no offsets —
+// and the cursor is left past the declared section so the next one starts in the
+// right place.
+func readVectorSegment(rw *byteops.ReadWriter, kind string) (vectorSegment, bool, error) {
+	if rw.Remaining() == 0 {
+		return vectorSegment{}, false, nil
 	}
-	return nil, nil
+
+	offsetsBlob, err := rw.ReadBytesFromBufferWithUint32LengthIndicatorChecked()
+	if err != nil {
+		return vectorSegment{}, false, fmt.Errorf("%s offsets: %w", kind, err)
+	}
+
+	segmentLength, err := rw.ReadUint32Checked()
+	if err != nil {
+		return vectorSegment{}, false, fmt.Errorf("%s segment length: %w", kind, err)
+	}
+
+	seg := vectorSegment{
+		offsetsBlob: offsetsBlob,
+		start:       rw.Position,
+		end:         rw.Position + uint64(segmentLength),
+	}
+	if seg.end > uint64(len(rw.Buffer)) {
+		return vectorSegment{}, false, fmt.Errorf("%s segment length %d exceeds buffer", kind, segmentLength)
+	}
+
+	if len(offsetsBlob) == 0 {
+		rw.MoveBufferToAbsolutePosition(seg.end)
+		return seg, false, nil
+	}
+	return seg, true, nil
+}
+
+func (seg vectorSegment) decodeOffsets(kind string) (map[string]uint32, error) {
+	var offsets map[string]uint32
+	if err := msgpack.Unmarshal(seg.offsetsBlob, &offsets); err != nil {
+		return nil, fmt.Errorf("could not unmarshal %s offset: %w", kind, err)
+	}
+	return offsets, nil
+}
+
+func skipVectorSegment(rw *byteops.ReadWriter, kind string) error {
+	seg, present, err := readVectorSegment(rw, kind)
+	if err != nil {
+		return err
+	}
+	if present {
+		rw.MoveBufferToAbsolutePosition(seg.end)
+	}
+	return nil
+}
+
+// The three readers below name no vector in their errors: they run per document
+// inside the multi-vector loop, where building a label would allocate on every
+// successful passage. Callers hold the names and wrap.
+
+// seekToVector requires room for the vector's headerLen-byte count prefix.
+// Offsets are read out of the value itself, so one landing outside the section
+// must fail here rather than decode the neighbouring section as a vector.
+func seekToVector(rw *byteops.ReadWriter, seg vectorSegment, offset uint32, headerLen uint64) error {
+	start := seg.start + uint64(offset)
+	if start+headerLen > seg.end {
+		return fmt.Errorf("offset %d out of segment bounds", offset)
+	}
+	rw.MoveBufferToAbsolutePosition(start)
+	return nil
+}
+
+// readVectorBytes widens dims before scaling it to bytes: the on-disk field is a
+// uint16 and the writer permits maxVectorLength dimensions, so a uint16
+// multiplication wraps from 16384 dimensions upwards.
+func readVectorBytes(rw *byteops.ReadWriter, seg vectorSegment) ([]byte, uint64, error) {
+	if rw.Position+byteops.Uint16Len > seg.end {
+		return nil, 0, errors.New("truncated at segment end")
+	}
+	dims := uint64(rw.ReadUint16())
+	if rw.Position+dims*byteops.Uint32Len > seg.end {
+		return nil, 0, fmt.Errorf("length %d exceeds segment", dims)
+	}
+	return rw.ReadBytesFromBuffer(dims * byteops.Uint32Len), dims, nil
+}
+
+// readVectorInto reuses buffer when it has the capacity. A nil buffer always
+// allocates, even for a zero-length vector: nil[:0] is nil, which a caller
+// holding the result in a map cannot tell apart from an absent vector.
+func readVectorInto(rw *byteops.ReadWriter, seg vectorSegment, buffer []float32) ([]float32, error) {
+	vecBytes, dims, err := readVectorBytes(rw, seg)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []float32
+	if buffer != nil && uint64(cap(buffer)) >= dims {
+		out = buffer[:dims]
+	} else {
+		out = make([]float32, dims)
+	}
+	byteops.CopyBytesToSlice(out, vecBytes)
+	return out, nil
+}
+
+func unmarshalTargetVectors(rw *byteops.ReadWriter) (map[string][]float32, error) {
+	seg, present, err := readVectorSegment(rw, "target vectors")
+	if err != nil || !present {
+		return nil, err
+	}
+
+	offsets, err := seg.decodeOffsets("target vectors")
+	if err != nil {
+		return nil, err
+	}
+
+	targetVectors := make(map[string][]float32, len(offsets))
+	for name, offset := range offsets {
+		if err := seekToVector(rw, seg, offset, byteops.Uint16Len); err != nil {
+			return nil, fmt.Errorf("target vector %q %w", name, err)
+		}
+		vec, err := readVectorInto(rw, seg, nil)
+		if err != nil {
+			return nil, fmt.Errorf("target vector %q %w", name, err)
+		}
+		targetVectors[name] = vec
+	}
+
+	rw.MoveBufferToAbsolutePosition(seg.end)
+	return targetVectors, nil
 }
 
 // unmarshalSingleTargetVector unmarshals only the requested target vector, reusing the
 // provided buffer if it has sufficient capacity. This avoids allocating memory for all
 // target vectors when only one is needed (e.g., during HNSW rescoring).
 func unmarshalSingleTargetVector(rw *byteops.ReadWriter, targetVector string, buffer []float32) ([]float32, error) {
-	if rw.Position >= uint64(len(rw.Buffer)) {
-		return nil, nil
+	seg, present, err := readVectorSegment(rw, "target vectors")
+	if err != nil || !present {
+		return nil, err
 	}
 
-	targetVectorsOffsets := rw.ReadBytesFromBufferWithUint32LengthIndicator()
-	targetVectorsSegmentLength := rw.ReadUint32()
-	pos := rw.Position
-
-	if len(targetVectorsOffsets) == 0 {
-		return nil, nil
+	offsets, err := seg.decodeOffsets("target vectors")
+	if err != nil {
+		return nil, err
 	}
 
-	var tvOffsets map[string]uint32
-	if err := msgpack.Unmarshal(targetVectorsOffsets, &tvOffsets); err != nil {
-		return nil, fmt.Errorf("could not unmarshal target vectors offset: %w", err)
-	}
-
-	offset, ok := tvOffsets[targetVector]
+	offset, ok := offsets[targetVector]
 	if !ok {
-		rw.MoveBufferToAbsolutePosition(pos + uint64(targetVectorsSegmentLength))
+		rw.MoveBufferToAbsolutePosition(seg.end)
 		return nil, ErrTargetVectorNotFound{TargetVector: targetVector}
 	}
 
-	rw.MoveBufferToAbsolutePosition(pos + uint64(offset))
-	vecLen := rw.ReadUint16()
-
-	var out []float32
-	if cap(buffer) >= int(vecLen) {
-		out = buffer[:vecLen]
-	} else {
-		out = make([]float32, vecLen)
+	if err := seekToVector(rw, seg, offset, byteops.Uint16Len); err != nil {
+		return nil, fmt.Errorf("target vector %q %w", targetVector, err)
+	}
+	out, err := readVectorInto(rw, seg, buffer)
+	if err != nil {
+		return nil, fmt.Errorf("target vector %q %w", targetVector, err)
 	}
 
-	byteops.CopyBytesToSlice(out, rw.ReadBytesFromBuffer(uint64(vecLen)*byteops.Uint32Len))
-
-	rw.MoveBufferToAbsolutePosition(pos + uint64(targetVectorsSegmentLength))
+	rw.MoveBufferToAbsolutePosition(seg.end)
 	return out, nil
 }
 
@@ -1560,48 +1814,55 @@ func unmarshalMultiVectors(
 	rw *byteops.ReadWriter,
 	onlyUnmarshalNames map[string]interface{},
 ) (map[string][][]float32, error) {
-	// This check prevents from panic when somebody is upgrading from version that
-	// didn't have multi vector support. This check is needed bc with the multi vectors
-	// feature the storage object can have vectors data appended at the end of the file
-	if rw.Position < uint64(len(rw.Buffer)) {
-		multiVectorsOffsets := rw.ReadBytesFromBufferWithUint32LengthIndicator()
-		multiVectorsSegmentLength := rw.ReadUint32()
-		pos := rw.Position
-
-		if len(multiVectorsOffsets) > 0 {
-			var mvOffsets map[string]uint32
-			if err := msgpack.Unmarshal(multiVectorsOffsets, &mvOffsets); err != nil {
-				return nil, fmt.Errorf("could not unmarshal multi vectors offset: %w", err)
-			}
-
-			// NOTE if you sort mvOffsets by offset, you may be able to speed this up via
-			// sequential reads, haven't tried this yet
-			multiVectors := map[string][][]float32{}
-			for name, offset := range mvOffsets {
-				// if onlyUnmarshalNames is not nil and non-empty, only unmarshal the vectors
-				// for the names in the map
-				if len(onlyUnmarshalNames) > 0 {
-					if _, ok := onlyUnmarshalNames[name]; !ok {
-						continue
-					}
-				}
-				rw.MoveBufferToAbsolutePosition(pos + uint64(offset))
-				numVecs := rw.ReadUint32()
-				vecs := make([][]float32, numVecs)
-				for i := 0; i < int(numVecs); i++ {
-					vecLen := rw.ReadUint16()
-					vec := make([]float32, vecLen)
-					byteops.CopyBytesToSlice(vec, rw.ReadBytesFromBuffer(uint64(vecLen)*byteops.Uint32Len))
-					vecs[i] = vec
-				}
-				multiVectors[name] = vecs
-			}
-
-			rw.MoveBufferToAbsolutePosition(pos + uint64(multiVectorsSegmentLength))
-			return multiVectors, nil
-		}
+	seg, present, err := readVectorSegment(rw, "multi vectors")
+	if err != nil || !present {
+		return nil, err
 	}
-	return nil, nil
+
+	offsets, err := seg.decodeOffsets("multi vectors")
+	if err != nil {
+		return nil, err
+	}
+
+	// NOTE if you sort offsets by offset, you may be able to speed this up via
+	// sequential reads, haven't tried this yet
+	multiVectors := make(map[string][][]float32, len(offsets))
+	for name, offset := range offsets {
+		// if onlyUnmarshalNames is not nil and non-empty, only unmarshal the vectors
+		// for the names in the map
+		if len(onlyUnmarshalNames) > 0 {
+			if _, ok := onlyUnmarshalNames[name]; !ok {
+				continue
+			}
+		}
+
+		if err := seekToVector(rw, seg, offset, byteops.Uint32Len); err != nil {
+			return nil, fmt.Errorf("multi vector %q %w", name, err)
+		}
+		numVecs := uint64(rw.ReadUint32())
+
+		// every document carries at least a length prefix, so the remaining segment
+		// caps the count. Without this the allocation below is sized by a uint32
+		// read straight out of the data.
+		maxVecs := (seg.end - rw.Position) / byteops.Uint16Len
+		if numVecs > maxVecs {
+			return nil, fmt.Errorf("multi vector %q truncated at document count: declares %d documents, segment holds at most %d",
+				name, numVecs, maxVecs)
+		}
+
+		vecs := make([][]float32, 0, numVecs)
+		for i := uint64(0); i < numVecs; i++ {
+			vec, err := readVectorInto(rw, seg, nil)
+			if err != nil {
+				return nil, fmt.Errorf("multi vector %q document %d %w", name, i, err)
+			}
+			vecs = append(vecs, vec)
+		}
+		multiVectors[name] = vecs
+	}
+
+	rw.MoveBufferToAbsolutePosition(seg.end)
+	return multiVectors, nil
 }
 
 func VectorFromBinary(in []byte, buffer []float32, targetVector string) ([]float32, error) {
@@ -1615,67 +1876,84 @@ func VectorFromBinary(in []byte, buffer []float32, targetVector string) ([]float
 	}
 
 	if targetVector != "" {
-		startPos := uint64(1 + 8 + 1 + 16 + 8 + 8) // elements at the start
-		rw := byteops.NewReadWriterWithPosition(in, startPos)
-
-		vectorLength := uint64(rw.ReadUint16())
-		rw.MoveBufferPositionForward(vectorLength * 4)
-
-		classnameLength := uint64(rw.ReadUint16())
-		rw.MoveBufferPositionForward(classnameLength)
-
-		schemaLength := uint64(rw.ReadUint32())
-		rw.MoveBufferPositionForward(schemaLength)
-
-		metaLength := uint64(rw.ReadUint32())
-		rw.MoveBufferPositionForward(metaLength)
-
-		vectorWeightsLength := uint64(rw.ReadUint32())
-		rw.MoveBufferPositionForward(vectorWeightsLength)
-
+		rw := byteops.NewReadWriterWithPosition(in, marshallerV1HeaderLen)
+		if err := skipToVectorSections(&rw); err != nil {
+			return nil, err
+		}
 		return unmarshalSingleTargetVector(&rw, targetVector, buffer)
 	}
 
-	// since we know the version and know that the blob is not len(0), we can
-	// assume that we can directly access the vector length field. The only
-	// situation where this is not accessible would be on corrupted data - where
-	// it would be acceptable to panic
-	vecLen := binary.LittleEndian.Uint16(in[marshallerV1HeaderLen : marshallerV1HeaderLen+2])
+	vecStart, vecEnd, vecLen, err := legacyVectorBounds(in)
+	if err != nil {
+		return nil, err
+	}
 	if vecLen == 0 {
 		return nil, fmt.Errorf("vector length is 0")
 	}
 
 	var out []float32
-	if cap(buffer) >= int(vecLen) {
+	if cap(buffer) >= vecLen {
 		out = buffer[:vecLen]
 	} else {
 		out = make([]float32, vecLen)
 	}
-	vecStart := 44
-	vecEnd := vecStart + int(vecLen*4)
 
 	byteops.CopyBytesToSlice(out, in[vecStart:vecEnd])
 
 	return out, nil
 }
 
-func incrementPos(in []byte, pos int, size int) int {
-	b := in[pos : pos+size]
-	if size == 2 {
-		length := binary.LittleEndian.Uint16(b)
-		pos += size + int(length)
-	} else if size == 4 {
-		length := binary.LittleEndian.Uint32(b)
-		pos += size + int(length)
-		return pos
-	} else if size == 8 {
-		length := binary.LittleEndian.Uint64(b)
-		pos += size + int(length)
+// legacyVectorBounds widens dims before scaling it to bytes: the on-disk field
+// is a uint16 and the writer permits maxVectorLength dimensions, so a uint16
+// multiplication wraps from 16384 dimensions upwards.
+func legacyVectorBounds(in []byte) (start, end, dims int, err error) {
+	if len(in) < marshallerV1HeaderLen+2 {
+		return 0, 0, 0, fmt.Errorf("object of %d bytes is too short to hold a vector length", len(in))
 	}
-	return pos
+
+	dims = int(binary.LittleEndian.Uint16(in[marshallerV1HeaderLen : marshallerV1HeaderLen+2]))
+	start = marshallerV1HeaderLen + 2
+	end = start + dims*byteops.Uint32Len
+
+	if end > len(in) {
+		return 0, 0, 0, fmt.Errorf("legacy vector of %d dimensions exceeds the %d byte object",
+			dims, len(in))
+	}
+	return start, end, dims, nil
 }
 
-func MultiVectorFromBinary(in []byte, buffer []float32, targetVector string) ([][]float32, error) {
+// skipToVectorSections walks the five length-prefixed fields between the fixed
+// header and the target-vector section.
+func skipToVectorSections(rw *byteops.ReadWriter) error {
+	vectorLength, err := rw.ReadUint16Checked()
+	if err != nil {
+		return fmt.Errorf("vector length: %w", err)
+	}
+	if err := rw.SkipChecked(uint64(vectorLength) * byteops.Uint32Len); err != nil {
+		return fmt.Errorf("vector: %w", err)
+	}
+
+	classNameLength, err := rw.ReadUint16Checked()
+	if err != nil {
+		return fmt.Errorf("class name length: %w", err)
+	}
+	if err := rw.SkipChecked(uint64(classNameLength)); err != nil {
+		return fmt.Errorf("class name: %w", err)
+	}
+
+	for _, field := range []string{"schema", "meta", "vector weights"} {
+		length, err := rw.ReadUint32Checked()
+		if err != nil {
+			return fmt.Errorf("%s length: %w", field, err)
+		}
+		if err := rw.SkipChecked(uint64(length)); err != nil {
+			return fmt.Errorf("%s: %w", field, err)
+		}
+	}
+	return nil
+}
+
+func MultiVectorFromBinary(in []byte, targetVector string) ([][]float32, error) {
 	if len(in) == 0 {
 		return nil, nil
 	}
@@ -1685,51 +1963,24 @@ func MultiVectorFromBinary(in []byte, buffer []float32, targetVector string) ([]
 		return nil, errors.Errorf("unsupported marshaller version %d", version)
 	}
 
-	// since we know the version and know that the blob is not len(0), we can
-	// assume that we can directly access the vector length field. The only
-	// situation where this is not accessible would be on corrupted data - where
-	// it would be acceptable to panic
-	vecLen := binary.LittleEndian.Uint16(in[marshallerV1HeaderLen : marshallerV1HeaderLen+2])
-
-	var out []float32
-	vecStart := 44
-	vecEnd := vecStart + int(vecLen*4)
-
-	if vecLen > 0 {
-		if cap(buffer) >= int(vecLen) {
-			out = buffer[:vecLen]
-		} else {
-			out = make([]float32, vecLen)
-		}
-		byteops.CopyBytesToSlice(out, in[vecStart:vecEnd])
+	rw := byteops.NewReadWriterWithPosition(in, marshallerV1HeaderLen)
+	if err := skipToVectorSections(&rw); err != nil {
+		return nil, err
+	}
+	if err := skipVectorSegment(&rw, "target vectors"); err != nil {
+		return nil, err
 	}
 
-	pos := vecEnd
-
-	pos = incrementPos(in, pos, 2) // classNameLength
-	pos = incrementPos(in, pos, 4) // schemaLength
-	pos = incrementPos(in, pos, 4) // metaLength
-	pos = incrementPos(in, pos, 4) // vectorWeightsLength
-	pos = incrementPos(in, pos, 4) // bufLen
-	pos = incrementPos(in, pos, 4) // targetVectorsSegmentLength
-
-	// multivector
-	var multiVectors map[string][][]float32
-
-	if len(in) > pos {
-		rw := byteops.NewReadWriterWithPosition(in, uint64(pos))
-		mv, err := unmarshalMultiVectors(&rw, map[string]interface{}{targetVector: nil})
-		if err != nil {
-			return nil, errors.Errorf("unable to unmarshal multivector for target vector: %s", targetVector)
-		}
-		multiVectors = mv
+	multiVectors, err := unmarshalMultiVectors(&rw, map[string]interface{}{targetVector: nil})
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal multivector for target vector %q: %w", targetVector, err)
 	}
 
-	mvout, ok := multiVectors[targetVector]
+	out, ok := multiVectors[targetVector]
 	if !ok {
 		return nil, errors.Errorf("vector not found for target vector: %s", targetVector)
 	}
-	return mvout, nil
+	return out, nil
 }
 
 func (ko *Object) parseObject(uuid strfmt.UUID, create, update int64, className string,
